@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,6 +29,7 @@ type Upstream struct {
 type Server struct {
 	cfg  *config.Config
 	ub   *unbound.Unbound
+	mu   sync.Mutex
 	dns1 *Upstream
 	dns2 *Upstream
 	dns3 *Upstream
@@ -222,6 +224,9 @@ func (s *Server) handleDNSQuery(data []byte, addr net.Addr, pc net.PacketConn) {
 
 /* ---------- resolveWithDNSSEC ---------- */
 func (s *Server) resolveWithDNSSEC(msg *dns.Msg) (*dns.Msg, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if len(msg.Question) == 0 {
 		return nil, fmt.Errorf("no question in DNS query")
 	}
