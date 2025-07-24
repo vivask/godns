@@ -230,15 +230,23 @@ func (s *Server) resolveLocal(msg *dns.Msg) *dns.Msg {
 	}
 	q := msg.Question[0]
 
-	rrs := s.zone.Match(q.Name, q.Qtype)
-	if len(rrs) == 0 {
-		return nil
+	// кандидаты имени: как есть и с добавленным origin
+	candidates := []string{
+		dns.CanonicalName(q.Name),
+		dns.CanonicalName(q.Name + "." + s.zone.origin),
 	}
 
-	resp := new(dns.Msg)
-	resp.SetReply(msg)
-	resp.Answer = rrs
-	return resp
+	for _, name := range candidates {
+		rrs := s.zone.Match(name, q.Qtype)
+		if len(rrs) == 0 {
+			continue
+		}
+		resp := new(dns.Msg)
+		resp.SetReply(msg)
+		resp.Answer = rrs
+		return resp
+	}
+	return nil
 }
 
 func (s *Server) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
