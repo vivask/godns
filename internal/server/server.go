@@ -56,7 +56,7 @@ func (s *Server) Run() error {
 	// SO_REUSEPORT при желании
 	if udpConn, ok := pc.(*net.UDPConn); ok {
 		if err := setReusePort(udpConn); err != nil {
-			log.Warnf("SO_REUSEPORT not supported", "err", err)
+			log.Warnf("SO_REUSEPORT not supported: %v", err)
 		}
 	}
 
@@ -68,12 +68,12 @@ func (s *Server) Run() error {
 		return err
 	}
 
-	log.Infof("listening", "addr", s.cfg.Listen)
+	log.Infof("listening: addr=%s", s.cfg.Listen)
 	for {
 		buf := make([]byte, dns.MaxMsgSize)
 		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
-			log.Errorf("read error", "err", err)
+			log.Errorf("read error: %v", err)
 			continue
 		}
 		go s.handle(pc, addr, buf[:n])
@@ -83,7 +83,7 @@ func (s *Server) Run() error {
 func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 	req := new(dns.Msg)
 	if err := req.Unpack(buf); err != nil {
-		log.Debugf("malformed packet", "err", err, "addr", addr)
+		log.Debugf("malformed packet: err=%v addr=%s", err, addr)
 		return
 	}
 
@@ -94,13 +94,13 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 	if resp, ok := s.cache.Get(key); ok {
 		resp.Id = req.Id
 		_ = s.send(pc, addr, resp)
-		log.Debugf("served from cache", "addr", addr, "q", req.Question[0].Name)
+		log.Debugf("served from cache: addr=%s q=%s", addr, req.Question[0].Name)
 		return
 	}
 
 	resp, err := s.resolve(ctx, req)
 	if err != nil {
-		log.Warnf("resolve error", "err", err)
+		log.Warnf("resolve error: %v", err)
 		resp = new(dns.Msg)
 		resp.SetRcode(req, dns.RcodeServerFailure)
 	}
@@ -109,7 +109,7 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 	s.cache.Put(key, resp)
 
 	_ = s.send(pc, addr, resp)
-	log.Debugf("resolved", "addr", addr, "q", req.Question[0].Name, "rcode", dns.RcodeToString[resp.Rcode])
+	log.Debugf("resolved: addr=%s q=%s rcode=%s", addr, req.Question[0].Name, dns.RcodeToString[resp.Rcode])
 }
 
 func (s *Server) resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
@@ -140,8 +140,6 @@ func cacheKey(m *dns.Msg) string {
 	q := m.Question[0]
 	return fmt.Sprintf("%s|%d|%d", q.Name, q.Qtype, q.Qclass)
 }
-
-func logWriter() *timeWriter { return &timeWriter{} }
 
 type timeWriter struct{}
 
