@@ -129,10 +129,6 @@ func New(cfg *config.Config) (*Server, error) {
 		log.Errorf("tls-cert-bundle: %v", err)
 		return nil, err
 	}
-	if err := ub.SetOption("timeout", "3000"); err != nil {
-		log.Errorf("timeout: %v", err)
-		return nil, err
-	}
 	if err := ub.SetOption("target-fetch-policy", "2 1 0"); err != nil {
 		log.Errorf("target-fetch-policy: %v", err)
 		return nil, err
