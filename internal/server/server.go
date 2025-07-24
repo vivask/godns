@@ -123,6 +123,9 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 		log.Debugf("malformed packet: err=%v addr=%s", err, addr)
 		return
 	}
+	if len(req.Question) == 0 {
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.Timeout)
 	defer cancel()
@@ -135,6 +138,7 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 		return
 	}
 
+	start := time.Now()
 	resp, err := s.resolve(ctx, req)
 	if err != nil {
 		log.Warnf("resolve error: %v", err)
@@ -146,7 +150,8 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 	s.cache.Put(key, resp)
 
 	_ = s.send(pc, addr, resp)
-	log.Debugf("resolved: addr=%s q=%s rcode=%s", addr, req.Question[0].Name, dns.RcodeToString[resp.Rcode])
+
+	s.logDNSResponse(start, req.Question[0], resp)
 }
 
 func (s *Server) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
@@ -211,4 +216,27 @@ type timeWriter struct{}
 
 func (w *timeWriter) Write(p []byte) (int, error) {
 	return fmt.Printf("%s %s", time.Now().Format(time.RFC3339), p)
+}
+
+func (s *Server) logDNSResponse(start time.Time, q dns.Question, resp *dns.Msg) {
+	duration := time.Since(start)
+	status := "INSECURE"
+	if resp.AuthenticatedData {
+		status = "SECURE"
+	}
+
+	answers := len(resp.Answer)
+	if resp.Rcode != dns.RcodeSuccess {
+		status = dns.RcodeToString[resp.Rcode]
+	}
+
+	fmt.Printf(
+		"[%s] %s %s %s → %d answers in %v\n",
+		status,
+		dns.TypeToString[q.Qtype],
+		q.Name,
+		dns.ClassToString[q.Qclass],
+		answers,
+		duration,
+	)
 }
