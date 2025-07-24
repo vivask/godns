@@ -8,7 +8,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"godns/internal/config"
@@ -31,9 +30,6 @@ type Server struct {
 	dns1 *Upstream
 	dns2 *Upstream
 	dns3 *Upstream
-
-	conns map[*Upstream]*dns.Conn // persistent DoT-коннекты
-	mu    sync.RWMutex
 }
 
 func parseUpstream(upstream string) (*Upstream, error) {
@@ -80,42 +76,13 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 
-	s := &Server{
+	return &Server{
 		cfg:   cfg,
 		cache: NewCache(cfg.CacheSize),
-		dns1:  dns1, dns2: dns2, dns3: dns3,
-		conns: make(map[*Upstream]*dns.Conn),
-	}
-	go s.initConnections() // стартуем в фоне
-	return s, nil
-}
-
-func (s *Server) initConnections() {
-	for _, up := range []*Upstream{s.dns1, s.dns2, s.dns3} {
-		go func(u *Upstream) {
-			for {
-				conn, err := s.dialUpstream(u)
-				if err != nil {
-					log.Errorf("health-check %s: %v", u.DialableAddress, err)
-					time.Sleep(5 * time.Second)
-					continue
-				}
-				s.mu.Lock()
-				s.conns[u] = conn
-				s.mu.Unlock()
-				return
-			}
-		}(up)
-	}
-}
-
-func (s *Server) dialUpstream(up *Upstream) (*dns.Conn, error) {
-	tlsCfg := &tls.Config{ServerName: up.ServerName, MinVersion: tls.VersionTLS13}
-	tcpConn, err := tls.Dial("tcp", up.DialableAddress, tlsCfg)
-	if err != nil {
-		return nil, err
-	}
-	return &dns.Conn{Conn: tcpConn}, nil
+		dns1:  dns1,
+		dns2:  dns2,
+		dns3:  dns3,
+	}, nil
 }
 
 func (s *Server) Run() error {
@@ -189,57 +156,44 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 }
 
 func (s *Server) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
-	up := s.pickUpstream()
-	conn := s.getConn(up)
-	if conn == nil {
-		return nil, fmt.Errorf("no connection to %s", up.DialableAddress)
+	// round-robin выбор upstream-а (DoT)
+	up := s.dns1
+	switch time.Now().UnixNano() % 3 {
+	case 1:
+		up = s.dns2
+	case 2:
+		up = s.dns3
 	}
 
+	tlsCfg := &tls.Config{
+		ServerName: up.ServerName,
+		MinVersion: tls.VersionTLS13,
+	}
+
+	client := &dns.Client{
+		Net:       "tcp-tls",
+		TLSConfig: tlsCfg,
+		Timeout:   s.cfg.Timeout,
+	}
+
+	// копия запроса
 	req := msg.Copy()
 	req.RecursionDesired = true
-	req.SetEdns0(1232, true)
-
-	// Оборачиваем ExchangeWithConn в мьютекс
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// Создаем клиент только для этого вызова
-	client := &dns.Client{
-		Net:         "tcp-tls",
-		DialTimeout: s.cfg.Timeout,
-		ReadTimeout: s.cfg.Timeout,
+	// просим апстрим проверить DNSSEC
+	opt := req.IsEdns0()
+	if opt == nil {
+		opt = new(dns.OPT)
+		opt.Hdr.Name = "."
+		opt.Hdr.Rrtype = dns.TypeOPT
+		opt.SetUDPSize(1232)
+		req.Extra = append(req.Extra, opt)
 	}
+	// устанавливаем DO (DNSSEC OK)
+	opt.SetDo(true)
 
-	resp, _, err := client.ExchangeWithConn(req, conn)
-	return resp, err
-}
+	r, _, err := client.ExchangeContext(ctx, req, up.DialableAddress)
 
-func (s *Server) pickUpstream() *Upstream {
-	switch time.Now().UnixNano() % 3 {
-	case 0:
-		return s.dns1
-	case 1:
-		return s.dns2
-	default:
-		return s.dns3
-	}
-}
-
-func (s *Server) getConn(up *Upstream) *dns.Conn {
-	s.mu.RLock()
-	conn, ok := s.conns[up]
-	s.mu.RUnlock()
-	if ok {
-		return conn
-	}
-	// быстрый реконнект
-	conn, _ = s.dialUpstream(up)
-	if conn != nil {
-		s.mu.Lock()
-		s.conns[up] = conn
-		s.mu.Unlock()
-	}
-	return conn
+	return r, err
 }
 
 func (s *Server) send(pc net.PacketConn, addr net.Addr, m *dns.Msg) error {
