@@ -2,8 +2,12 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"godns/internal/config"
@@ -13,10 +17,44 @@ import (
 	"github.com/miekg/unbound"
 )
 
+type Upstream struct {
+	ServerName      string
+	Address         string
+	Port            int
+	DialableAddress string
+}
+
 type Server struct {
 	cfg   *config.Config
 	ub    *unbound.Unbound
 	cache *Cache
+	dns1  *Upstream
+	dns2  *Upstream
+}
+
+func parseUpstream(upstream string) (*Upstream, error) {
+	// server:port@address
+	parts := strings.SplitN(upstream, "@", 2)
+	if len(parts) != 2 {
+		return nil, errors.New("upstream must be in format server:port@address")
+	}
+
+	hostPort := strings.SplitN(parts[0], ":", 2)
+	if len(hostPort) != 2 {
+		return nil, errors.New("server part must be in format host:port")
+	}
+
+	port, err := strconv.Atoi(hostPort[1])
+	if err != nil {
+		return nil, errors.New("port must be integer")
+	}
+
+	return &Upstream{
+		ServerName:      hostPort[0],
+		Address:         parts[1],
+		Port:            port,
+		DialableAddress: fmt.Sprintf("%s:%d", parts[1], port),
+	}, nil
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -40,10 +78,24 @@ func New(cfg *config.Config) (*Server, error) {
 	}
 
 	log.Infof("unbound initialized")
+
+	dns1, err := parseUpstream(cfg.DNS1)
+	if err != nil {
+		log.Errorf("parse upstream [%s] error: %v", cfg.DNS1, err)
+		return nil, err
+	}
+	dns2, err := parseUpstream(cfg.DNS2)
+	if err != nil {
+		log.Errorf("parse upstream [%s] error: %v", cfg.DNS2, err)
+		return nil, err
+	}
+
 	return &Server{
 		cfg:   cfg,
 		ub:    ub,
 		cache: NewCache(cfg.CacheSize),
+		dns1:  dns1,
+		dns2:  dns2,
 	}, nil
 }
 
@@ -114,12 +166,27 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 
 func (s *Server) resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 	// round-robin выбор upstream-а (DoT)
-	up := s.cfg.DNS1
+	up := s.dns1.DialableAddress
+	serverName := s.dns1.ServerName
 	if time.Now().UnixNano()%2 == 0 {
-		up = s.cfg.DNS2
+		up = s.dns2.DialableAddress
+		serverName = s.dns2.ServerName
 	}
 
-	return dns.ExchangeContext(ctx, req, up)
+	tlsCfg := &tls.Config{
+		ServerName: serverName,
+		MinVersion: tls.VersionTLS13,
+	}
+
+	client := &dns.Client{
+		Net:       "tcp-tls",
+		TLSConfig: tlsCfg,
+		Timeout:   s.cfg.Timeout,
+	}
+
+	r, _, err := client.ExchangeContext(ctx, req, up)
+
+	return r, err
 }
 
 func (s *Server) send(pc net.PacketConn, addr net.Addr, m *dns.Msg) error {

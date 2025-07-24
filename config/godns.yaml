@@ -1,6 +1,6 @@
 listen:       ":53"
-dns1:         "tcp-tls://8.8.8.8:853"
-dns2:         "tcp-tls://1.1.1.1:853"
+dns1:         "dns.google:853@8.8.8.8"
+dns2:         "cloudflare-dns.com:853@1.1.1.1"
 cache_size:   10000     # записей
 timeout:      2s
 log_level:    debug
