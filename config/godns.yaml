@@ -1,6 +1,6 @@
 listen:       ":53"
-dns1:         "8.8.8.8:853"   # DoT
-dns2:         "1.1.1.1:853"   # DoT
+dns1:         "tcp-tls://8.8.8.8:853"
+dns2:         "tcp-tls://1.1.1.1:853"
 cache_size:   10000     # записей
 timeout:      2s
 log_level:    debug

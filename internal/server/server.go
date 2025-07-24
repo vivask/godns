@@ -119,9 +119,7 @@ func (s *Server) resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
 		up = s.cfg.DNS2
 	}
 
-	// Для DoT нужно указать схему "tcp-tls"
-	m, err := dns.ExchangeContext(ctx, req, up)
-	return m, err
+	return dns.ExchangeContext(ctx, req, up)
 }
 
 func (s *Server) send(pc net.PacketConn, addr net.Addr, m *dns.Msg) error {
