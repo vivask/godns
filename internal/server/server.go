@@ -230,7 +230,7 @@ func (s *Server) logDNSResponse(start time.Time, q dns.Question, resp *dns.Msg) 
 		status = dns.RcodeToString[resp.Rcode]
 	}
 
-	fmt.Printf(
+	log.Debugf(
 		"[%s] %s %s %s → %d answers in %v\n",
 		status,
 		dns.TypeToString[q.Qtype],

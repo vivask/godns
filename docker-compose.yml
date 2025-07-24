@@ -8,13 +8,13 @@ services:
     container_name: godns
     ports:
       - "53:53/udp"
-      - "853:853"
+      - "853:853/tcp"
     volumes:
       - ./config/godns.yaml:/etc/godns.yaml:ro
       - /var/log/godns:/var/log/godns
     cap_add:
-#      - NET_BIND_SERVICE
-      - NET_ADMIN
+      - NET_BIND_SERVICE
+#      - NET_ADMIN
     restart: unless-stopped
     environment:
       TZ: "Europe/Minsk"
