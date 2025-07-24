@@ -15,6 +15,7 @@ ENV TZ=""
 
 COPY --from=gobuilder /app/godns /usr/local/bin/godns
 COPY ./config/godns.yaml /etc/godns.yaml
+COPY ./config/unbound.conf /etc/unbound/unbound.conf
 COPY ./entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

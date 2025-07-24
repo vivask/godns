@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -28,7 +27,7 @@ type Upstream struct {
 
 type Server struct {
 	cfg  *config.Config
-	pool sync.Pool
+	ub   *unbound.Unbound
 	dns1 *Upstream
 	dns2 *Upstream
 	dns3 *Upstream
@@ -56,96 +55,17 @@ func parseUpstream(upstream string) (*Upstream, error) {
 	}, nil
 }
 
-func newUnboundInstance(cfg *config.Config, dns1 *Upstream, dns2 *Upstream, dns3 *Upstream) *unbound.Unbound {
-	ub := unbound.New()
-
-	// DNSSEC + cache + DoT-настройки
-	if err := ub.SetOption("auto-trust-anchor-file", "/etc/unbound/root.key"); err != nil {
-		log.Errorf("auto-trust-anchor-file: %v", err)
-		return nil
-	}
-	if err := ub.SetOption("module-config", "validator iterator"); err != nil {
-		log.Errorf("module-config: %v", err)
-		return nil
-	}
-	if err := ub.SetOption("harden-dnssec-stripped", "yes"); err != nil {
-		log.Errorf("harden-dnssec-stripped: %v", err)
-		return nil
-	}
-	if err := ub.SetOption("val-clean-additional", "yes"); err != nil {
-		log.Errorf("val-clean-additional: %v", err)
-		return nil
-	}
-	if err := ub.SetOption("msg-cache-size", "50m"); err != nil {
-		log.Errorf("msg-cache-size: %v", err)
-		return nil
-	}
-	if err := ub.SetOption("rrset-cache-size", "100m"); err != nil {
-		log.Errorf("rrset-cache-size: %v", err)
-		return nil
-	}
-	if err := ub.SetOption("cache-min-ttl", "300"); err != nil {
-		log.Errorf("cache-min-ttl: %v", err)
-		return nil
-	}
-	if err := ub.SetOption("cache-max-ttl", "3600"); err != nil {
-		log.Errorf("cache-max-ttl: %v", err)
-		return nil
-	}
-	// Формируем строку для SetFwd
-	servers := []string{
-		fmt.Sprintf("%s@%d", dns1.Address, dns1.Port),
-		fmt.Sprintf("%s@%d", dns2.Address, dns2.Port),
-		fmt.Sprintf("%s@%d", dns3.Address, dns3.Port),
-	}
-	fwdStr := strings.Join(servers, " ")
-	if err := ub.SetFwd(fwdStr); err != nil {
-		log.Errorf("set fwd: %v", err)
-		return nil
-	}
-	if err := ub.SetOption("tls-upstream", "yes"); err != nil {
-		log.Errorf("tls-upstream: %v", err)
-		return nil
-	}
-	if err := ub.SetOption("tls-cert-bundle", "/etc/ssl/certs/ca-certificates.crt"); err != nil {
-		log.Errorf("tls-cert-bundle: %v", err)
-		return nil
-	}
-	if err := ub.SetOption("target-fetch-policy", "2 1 0"); err != nil {
-		log.Errorf("target-fetch-policy: %v", err)
-		return nil
-	}
-
-	log.Infof("unbound initialized")
-
-	return ub
-}
-
 /* ---------- New (сигнатура и вызовы не менялись) ---------- */
 func New(cfg *config.Config) (*Server, error) {
+	ub := unbound.New()
 
-	// Upstream-ы
-	dns1, err := parseUpstream(cfg.DNS1)
-	if err != nil {
-		log.Errorf("parse upstream [%s] error: %v", cfg.DNS1, err)
-		return nil, err
-	}
-	dns2, err := parseUpstream(cfg.DNS2)
-	if err != nil {
-		log.Errorf("parse upstream [%s] error: %v", cfg.DNS2, err)
-		return nil, err
-	}
-	dns3, err := parseUpstream(cfg.DNS3)
-	if err != nil {
-		log.Errorf("parse upstream [%s] error: %v", cfg.DNS3, err)
-		return nil, err
+	// Загружаем готовый конфиг-файл
+	if err := ub.Config("/etc/unbound/unbound.conf"); err != nil {
+		return nil, fmt.Errorf("unbound config: %w", err)
 	}
 
-	s := &Server{cfg: cfg, dns1: dns1, dns2: dns2, dns3: dns3}
-	s.pool.New = func() interface{} {
-		return newUnboundInstance(cfg, dns1, dns2, dns3)
-	}
-	return s, nil
+	log.Infof("unbound initialized from /etc/unbound/unbound.conf")
+	return &Server{cfg: cfg, ub: ub}, nil
 }
 
 /* ---------- Run ---------- */
@@ -231,10 +151,7 @@ func (s *Server) resolveWithDNSSEC(msg *dns.Msg) (*dns.Msg, error) {
 	}
 	q := msg.Question[0]
 
-	ub := s.pool.Get().(*unbound.Unbound)
-	defer s.pool.Put(ub)
-
-	result, err := ub.Resolve(q.Name, uint16(q.Qtype), uint16(q.Qclass))
+	result, err := s.ub.Resolve(q.Name, uint16(q.Qtype), uint16(q.Qclass))
 	if err != nil {
 		return nil, err
 	}
@@ -256,14 +173,7 @@ func (s *Server) resolveWithDNSSEC(msg *dns.Msg) (*dns.Msg, error) {
 	}
 
 	// result.Rr уже []dns.RR
-	for _, rr := range result.Rr {
-		switch rr.Header().Rrtype {
-		case dns.TypeRRSIG, dns.TypeDNSKEY, dns.TypeDS, dns.TypeNSEC, dns.TypeNSEC3:
-			resp.Ns = append(resp.Ns, rr)
-		default:
-			resp.Answer = append(resp.Answer, rr)
-		}
-	}
+	resp.Answer = append(resp.Answer, result.Rr...)
 
 	return resp, nil
 }
