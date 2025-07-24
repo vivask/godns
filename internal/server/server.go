@@ -230,7 +230,8 @@ func (s *Server) resolveLocal(msg *dns.Msg) *dns.Msg {
 	}
 	q := msg.Question[0]
 
-	// кандидаты имени: как есть и с добавленным origin
+	// 1. имя как есть
+	// 2. имя + origin
 	candidates := []string{
 		dns.CanonicalName(q.Name),
 		dns.CanonicalName(q.Name + "." + s.zone.origin),
