@@ -8,7 +8,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"godns/internal/config"
@@ -25,15 +24,12 @@ type Upstream struct {
 }
 
 type Server struct {
-	cfg       *config.Config
-	cache     *Cache
-	upstreams []*Upstream
+	cfg   *config.Config
+	cache *Cache
 
-	// пул TLS-коннектов
-	conns   map[*Upstream]*tls.Conn
-	connMu  sync.RWMutex
-	wg      sync.WaitGroup
-	closeCh chan struct{}
+	dns1 *Upstream
+	dns2 *Upstream
+	dns3 *Upstream
 }
 
 func parseUpstream(upstream string) (*Upstream, error) {
@@ -63,30 +59,30 @@ func parseUpstream(upstream string) (*Upstream, error) {
 
 func New(cfg *config.Config) (*Server, error) {
 
-	u1, err := parseUpstream(cfg.DNS1)
+	// Парсинг dns строк
+	dns1, err := parseUpstream(cfg.DNS1)
 	if err != nil {
+		log.Errorf("parse upstream [%s] error: %v", cfg.DNS1, err)
 		return nil, err
 	}
-	u2, err := parseUpstream(cfg.DNS2)
+	dns2, err := parseUpstream(cfg.DNS2)
 	if err != nil {
+		log.Errorf("parse upstream [%s] error: %v", cfg.DNS2, err)
 		return nil, err
 	}
-	u3, err := parseUpstream(cfg.DNS3)
+	dns3, err := parseUpstream(cfg.DNS3)
 	if err != nil {
+		log.Errorf("parse upstream [%s] error: %v", cfg.DNS3, err)
 		return nil, err
 	}
 
-	s := &Server{
-		cfg:       cfg,
-		cache:     NewCache(cfg.CacheSize),
-		upstreams: []*Upstream{u1, u2, u3},
-		conns:     make(map[*Upstream]*tls.Conn),
-		closeCh:   make(chan struct{}),
-	}
-	// запускаем health-check в фоне
-	s.wg.Add(1)
-	go s.healthLoop()
-	return s, nil
+	return &Server{
+		cfg:   cfg,
+		cache: NewCache(cfg.CacheSize),
+		dns1:  dns1,
+		dns2:  dns2,
+		dns3:  dns3,
+	}, nil
 }
 
 func (s *Server) Run() error {
@@ -94,18 +90,25 @@ func (s *Server) Run() error {
 	if err != nil {
 		return err
 	}
-	defer pc.Close()
 
-	// SO_REUSEPORT / буферы (как было)
+	// SO_REUSEPORT при желании
 	if udpConn, ok := pc.(*net.UDPConn); ok {
-		_ = setReusePort(udpConn)
-		_ = udpConn.SetReadBuffer(1 << 20)
-		_ = udpConn.SetWriteBuffer(1 << 20)
+		if err := setReusePort(udpConn); err != nil {
+			log.Warnf("SO_REUSEPORT not supported: %v", err)
+		}
 	}
-	log.Infof("listening: addr=%s", s.cfg.Listen)
 
-	buf := make([]byte, dns.MaxMsgSize)
+	// 1 MB read buffer
+	if err := pc.(*net.UDPConn).SetReadBuffer(1 << 20); err != nil {
+		return err
+	}
+	if err := pc.(*net.UDPConn).SetWriteBuffer(1 << 20); err != nil {
+		return err
+	}
+
+	log.Infof("listening: addr=%s", s.cfg.Listen)
 	for {
+		buf := make([]byte, dns.MaxMsgSize)
 		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
 			log.Errorf("read error: %v", err)
@@ -115,19 +118,6 @@ func (s *Server) Run() error {
 	}
 }
 
-// ---------- Shutdown ----------
-func (s *Server) Shutdown() {
-	close(s.closeCh)
-	s.wg.Wait()
-	s.connMu.Lock()
-	for u, c := range s.conns {
-		_ = c.Close()
-		delete(s.conns, u)
-	}
-	s.connMu.Unlock()
-}
-
-// ---------- handle ----------
 func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 	req := new(dns.Msg)
 	if err := req.Unpack(buf); err != nil {
@@ -159,128 +149,51 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 
 	resp.Id = req.Id
 	s.cache.Put(key, resp)
+
 	_ = s.send(pc, addr, resp)
+
 	s.logDNSResponse(start, req.Question[0], resp)
 }
 
 func (s *Server) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
-
-	// копия запроса
-	// req := msg.Copy()
-	// req.RecursionDesired = true
-	// opt := req.IsEdns0()
-	// if opt == nil {
-	// 	opt = new(dns.OPT)
-	// 	opt.Hdr.Name = "."
-	// 	opt.Hdr.Rrtype = dns.TypeOPT
-	// 	opt.SetUDPSize(1232)
-	// 	req.Extra = append(req.Extra, opt)
-	// }
-	// устанавливаем DO (DNSSEC OK)
-	// opt.SetDo(true)
-
-	up := s.pickUpstream()
-	conn := s.getConn(up)
-	if conn == nil {
-		return nil, fmt.Errorf("no connection to %s", up.DialableAddress)
-	}
-
-	req := msg.Copy()
-	req.RecursionDesired = true
-	req.SetEdns0(1232, true)
-
-	client := &dns.Client{Net: "tcp"}
-	// ExchangeWithConn использует уже готовый *tls.Conn
-	r, _, err := client.ExchangeWithConn(req, &dns.Conn{Conn: conn})
-	return r, err
-}
-
-// ---------- pickUpstream ----------
-func (s *Server) pickUpstream() *Upstream {
-	// round-robin
-	n := time.Now().UnixNano()
-	switch int(n % 3) {
-	case 0:
-		return s.upstreams[0]
+	// round-robin выбор upstream-а (DoT)
+	up := s.dns1
+	switch time.Now().UnixNano() % 3 {
 	case 1:
-		return s.upstreams[1]
-	default:
-		return s.upstreams[2]
+		up = s.dns2
+	case 2:
+		up = s.dns3
 	}
-}
 
-// ---------- getConn ----------
-func (s *Server) getConn(up *Upstream) *tls.Conn {
-	s.connMu.RLock()
-	conn, ok := s.conns[up]
-	s.connMu.RUnlock()
-	if ok {
-		return conn
-	}
-	// быстрый реконнект
-	conn, err := s.dialUpstream(up)
-	if err != nil {
-		log.Warnf("dial %s: %v", up.DialableAddress, err)
-		return nil
-	}
-	s.connMu.Lock()
-	s.conns[up] = conn
-	s.connMu.Unlock()
-	return conn
-}
-
-// ---------- dialUpstream ----------
-func (s *Server) dialUpstream(up *Upstream) (*tls.Conn, error) {
 	tlsCfg := &tls.Config{
 		ServerName: up.ServerName,
 		MinVersion: tls.VersionTLS13,
 	}
-	return tls.Dial("tcp", up.DialableAddress, tlsCfg)
-}
 
-// ---------- healthLoop ----------
-func (s *Server) healthLoop() {
-	defer s.wg.Done()
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			s.checkConnections()
-		case <-s.closeCh:
-			return
-		}
+	client := &dns.Client{
+		Net:       "tcp-tls",
+		TLSConfig: tlsCfg,
+		Timeout:   s.cfg.Timeout,
 	}
-}
 
-// ---------- checkConnections ----------
-func (s *Server) checkConnections() {
-	for _, up := range s.upstreams {
-		go func(u *Upstream) {
-			conn := s.getConn(u)
-			if conn == nil {
-				return
-			}
-
-			m := new(dns.Msg)
-			m.SetQuestion("example.com.", dns.TypeA)
-
-			_, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-
-			// ExchangeWithConn через уже готовый *tls.Conn
-			client := &dns.Client{Net: "tcp"}
-			_, _, err := client.ExchangeWithConn(m, &dns.Conn{Conn: conn})
-			if err != nil {
-				log.Warnf("health-check %s: %v", u.DialableAddress, err)
-				s.connMu.Lock()
-				_ = conn.Close()
-				delete(s.conns, u)
-				s.connMu.Unlock()
-			}
-		}(up)
+	// копия запроса
+	req := msg.Copy()
+	req.RecursionDesired = true
+	// просим апстрим проверить DNSSEC
+	opt := req.IsEdns0()
+	if opt == nil {
+		opt = new(dns.OPT)
+		opt.Hdr.Name = "."
+		opt.Hdr.Rrtype = dns.TypeOPT
+		opt.SetUDPSize(1232)
+		req.Extra = append(req.Extra, opt)
 	}
+	// устанавливаем DO (DNSSEC OK)
+	opt.SetDo(true)
+
+	r, _, err := client.ExchangeContext(ctx, req, up.DialableAddress)
+
+	return r, err
 }
 
 func (s *Server) send(pc net.PacketConn, addr net.Addr, m *dns.Msg) error {

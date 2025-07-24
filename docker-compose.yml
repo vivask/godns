@@ -8,7 +8,6 @@ services:
     container_name: godns
     ports:
       - "53:53/udp"
-      - "853:853/tcp"
     volumes:
       - ./config/godns.yaml:/etc/godns.yaml:ro
       - /var/log/godns:/var/log/godns

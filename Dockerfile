@@ -17,6 +17,6 @@ COPY ./config/godns.yaml /etc/godns.yaml
 COPY ./entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 53/udp 853/tcp
+EXPOSE 53/udp
 
 ENTRYPOINT ["/entrypoint.sh"]
