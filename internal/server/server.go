@@ -28,9 +28,7 @@ type Server struct {
 	cfg   *config.Config
 	cache *Cache
 
-	dns1 *Upstream
-	dns2 *Upstream
-	dns3 *Upstream
+	upstreams []*Upstream
 
 	conns map[*Upstream]*dns.Conn // persistent DoT-коннекты
 	mu    sync.RWMutex
@@ -64,34 +62,31 @@ func parseUpstream(upstream string) (*Upstream, error) {
 func New(cfg *config.Config) (*Server, error) {
 
 	// Парсинг dns строк
-	dns1, err := parseUpstream(cfg.DNS1)
+	u1, err := parseUpstream(cfg.DNS1)
 	if err != nil {
-		log.Errorf("parse upstream [%s] error: %v", cfg.DNS1, err)
 		return nil, err
 	}
-	dns2, err := parseUpstream(cfg.DNS2)
+	u2, err := parseUpstream(cfg.DNS2)
 	if err != nil {
-		log.Errorf("parse upstream [%s] error: %v", cfg.DNS2, err)
 		return nil, err
 	}
-	dns3, err := parseUpstream(cfg.DNS3)
+	u3, err := parseUpstream(cfg.DNS3)
 	if err != nil {
-		log.Errorf("parse upstream [%s] error: %v", cfg.DNS3, err)
 		return nil, err
 	}
 
 	s := &Server{
-		cfg:   cfg,
-		cache: NewCache(cfg.CacheSize),
-		dns1:  dns1, dns2: dns2, dns3: dns3,
-		conns: make(map[*Upstream]*dns.Conn),
+		cfg:       cfg,
+		cache:     NewCache(cfg.CacheSize),
+		upstreams: []*Upstream{u1, u2, u3},
+		conns:     make(map[*Upstream]*dns.Conn),
 	}
 	go s.initConnections() // стартуем в фоне
 	return s, nil
 }
 
 func (s *Server) initConnections() {
-	for _, up := range []*Upstream{s.dns1, s.dns2, s.dns3} {
+	for _, up := range s.upstreams {
 		go func(u *Upstream) {
 			for {
 				conn, err := s.dialUpstream(u)
@@ -197,7 +192,18 @@ func (s *Server) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
 
 	req := msg.Copy()
 	req.RecursionDesired = true
-	req.SetEdns0(1232, true)
+
+	// просим апстрим проверить DNSSEC
+	opt := req.IsEdns0()
+	if opt == nil {
+		opt = new(dns.OPT)
+		opt.Hdr.Name = "."
+		opt.Hdr.Rrtype = dns.TypeOPT
+		opt.SetUDPSize(1232)
+		req.Extra = append(req.Extra, opt)
+	}
+	// устанавливаем DO (DNSSEC OK)
+	opt.SetDo(true)
 
 	// Оборачиваем ExchangeWithConn в мьютекс
 	s.mu.RLock()
@@ -214,17 +220,21 @@ func (s *Server) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
 	return resp, err
 }
 
+// ---------- pickUpstream ----------
 func (s *Server) pickUpstream() *Upstream {
-	switch time.Now().UnixNano() % 3 {
+	// round-robin
+	n := time.Now().UnixNano()
+	switch int(n % 3) {
 	case 0:
-		return s.dns1
+		return s.upstreams[0]
 	case 1:
-		return s.dns2
+		return s.upstreams[1]
 	default:
-		return s.dns3
+		return s.upstreams[2]
 	}
 }
 
+// ---------- getConn ----------
 func (s *Server) getConn(up *Upstream) *dns.Conn {
 	s.mu.RLock()
 	conn, ok := s.conns[up]
