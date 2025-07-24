@@ -1,7 +1,7 @@
 listen:       ":53"
 dns1:         "dns.google:853@8.8.8.8"
 dns2:         "cloudflare-dns.com:853@1.1.1.1"
-dns3:         "quad9:853@9.9.9.9"
+dns3:         "dns.quad9.net:853@9.9.9.9"
 cache_size:   10000     # записей
 timeout:      2s
 log_level:    debug
