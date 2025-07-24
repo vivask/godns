@@ -28,8 +28,7 @@ type Upstream struct {
 
 type Server struct {
 	cfg  *config.Config
-	ub   *unbound.Unbound
-	mu   sync.Mutex
+	pool sync.Pool
 	dns1 *Upstream
 	dns2 *Upstream
 	dns3 *Upstream
@@ -57,43 +56,73 @@ func parseUpstream(upstream string) (*Upstream, error) {
 	}, nil
 }
 
-/* ---------- New (сигнатура и вызовы не менялись) ---------- */
-func New(cfg *config.Config) (*Server, error) {
+func newUnboundInstance(cfg *config.Config, dns1 *Upstream, dns2 *Upstream, dns3 *Upstream) *unbound.Unbound {
 	ub := unbound.New()
 
 	// DNSSEC + cache + DoT-настройки
 	if err := ub.SetOption("auto-trust-anchor-file", "/etc/unbound/root.key"); err != nil {
 		log.Errorf("auto-trust-anchor-file: %v", err)
-		return nil, err
+		return nil
 	}
 	if err := ub.SetOption("module-config", "validator iterator"); err != nil {
 		log.Errorf("module-config: %v", err)
-		return nil, err
+		return nil
 	}
 	if err := ub.SetOption("harden-dnssec-stripped", "yes"); err != nil {
 		log.Errorf("harden-dnssec-stripped: %v", err)
-		return nil, err
+		return nil
 	}
 	if err := ub.SetOption("val-clean-additional", "yes"); err != nil {
 		log.Errorf("val-clean-additional: %v", err)
-		return nil, err
+		return nil
 	}
 	if err := ub.SetOption("msg-cache-size", "50m"); err != nil {
 		log.Errorf("msg-cache-size: %v", err)
-		return nil, err
+		return nil
 	}
 	if err := ub.SetOption("rrset-cache-size", "100m"); err != nil {
 		log.Errorf("rrset-cache-size: %v", err)
-		return nil, err
+		return nil
 	}
 	if err := ub.SetOption("cache-min-ttl", "300"); err != nil {
 		log.Errorf("cache-min-ttl: %v", err)
-		return nil, err
+		return nil
 	}
 	if err := ub.SetOption("cache-max-ttl", "3600"); err != nil {
 		log.Errorf("cache-max-ttl: %v", err)
-		return nil, err
+		return nil
 	}
+	// Формируем строку для SetFwd
+	servers := []string{
+		fmt.Sprintf("%s@%d", dns1.Address, dns1.Port),
+		fmt.Sprintf("%s@%d", dns2.Address, dns2.Port),
+		fmt.Sprintf("%s@%d", dns3.Address, dns3.Port),
+	}
+	fwdStr := strings.Join(servers, " ")
+	if err := ub.SetFwd(fwdStr); err != nil {
+		log.Errorf("set fwd: %v", err)
+		return nil
+	}
+	if err := ub.SetOption("tls-upstream", "yes"); err != nil {
+		log.Errorf("tls-upstream: %v", err)
+		return nil
+	}
+	if err := ub.SetOption("tls-cert-bundle", "/etc/ssl/certs/ca-certificates.crt"); err != nil {
+		log.Errorf("tls-cert-bundle: %v", err)
+		return nil
+	}
+	if err := ub.SetOption("target-fetch-policy", "2 1 0"); err != nil {
+		log.Errorf("target-fetch-policy: %v", err)
+		return nil
+	}
+
+	log.Infof("unbound initialized")
+
+	return ub
+}
+
+/* ---------- New (сигнатура и вызовы не менялись) ---------- */
+func New(cfg *config.Config) (*Server, error) {
 
 	// Upstream-ы
 	dns1, err := parseUpstream(cfg.DNS1)
@@ -112,38 +141,11 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 
-	// Формируем строку для SetFwd
-	servers := []string{
-		fmt.Sprintf("%s@%d", dns1.Address, dns1.Port),
-		fmt.Sprintf("%s@%d", dns2.Address, dns2.Port),
-		fmt.Sprintf("%s@%d", dns3.Address, dns3.Port),
+	s := &Server{cfg: cfg, dns1: dns1, dns2: dns2, dns3: dns3}
+	s.pool.New = func() interface{} {
+		return newUnboundInstance(cfg, dns1, dns2, dns3)
 	}
-	fwdStr := strings.Join(servers, " ")
-	if err := ub.SetFwd(fwdStr); err != nil {
-		log.Errorf("set fwd: %v", err)
-		return nil, err
-	}
-	if err := ub.SetOption("tls-upstream", "yes"); err != nil {
-		log.Errorf("tls-upstream: %v", err)
-		return nil, err
-	}
-	if err := ub.SetOption("tls-cert-bundle", "/etc/ssl/certs/ca-certificates.crt"); err != nil {
-		log.Errorf("tls-cert-bundle: %v", err)
-		return nil, err
-	}
-	if err := ub.SetOption("target-fetch-policy", "2 1 0"); err != nil {
-		log.Errorf("target-fetch-policy: %v", err)
-		return nil, err
-	}
-
-	log.Infof("unbound initialized")
-	return &Server{
-		cfg:  cfg,
-		ub:   ub,
-		dns1: dns1,
-		dns2: dns2,
-		dns3: dns3,
-	}, nil
+	return s, nil
 }
 
 /* ---------- Run ---------- */
@@ -224,15 +226,15 @@ func (s *Server) handleDNSQuery(data []byte, addr net.Addr, pc net.PacketConn) {
 
 /* ---------- resolveWithDNSSEC ---------- */
 func (s *Server) resolveWithDNSSEC(msg *dns.Msg) (*dns.Msg, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if len(msg.Question) == 0 {
-		return nil, fmt.Errorf("no question in DNS query")
+		return nil, fmt.Errorf("no question")
 	}
 	q := msg.Question[0]
 
-	result, err := s.ub.Resolve(q.Name, uint16(q.Qtype), uint16(q.Qclass))
+	ub := s.pool.Get().(*unbound.Unbound)
+	defer s.pool.Put(ub)
+
+	result, err := ub.Resolve(q.Name, uint16(q.Qtype), uint16(q.Qclass))
 	if err != nil {
 		return nil, err
 	}
