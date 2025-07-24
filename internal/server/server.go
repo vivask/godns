@@ -170,7 +170,7 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 	start := time.Now()
 	resp, err := s.resolve(ctx, req)
 	if err != nil {
-		log.Warnf("resolve error: %v", err)
+		log.Warnf("resolve [%s] error: %v", req.Question[0].Name, err)
 		resp = new(dns.Msg)
 		resp.SetRcode(req, dns.RcodeServerFailure)
 	}
