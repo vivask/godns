@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  godns:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: godns
+    container_name: godns
+    ports:
+      - "53:53/udp"
+      - "853:853/tcp"
+    volumes:
+      - ./config/godns.yaml:/etc/godns.yaml:ro
+    cap_add:
+      - NET_BIND_SERVICE
+    restart: unless-stopped
+    environment:
+      TZ: "Europe/Minsk"

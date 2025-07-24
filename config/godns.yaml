@@ -1,0 +1,6 @@
+listen:       ":53"
+dns1:         "8.8.8.8:853"   # DoT
+dns2:         "1.1.1.1:853"   # DoT
+cache_size:   10000     # записей
+timeout:      2s
+log_level:    debug
