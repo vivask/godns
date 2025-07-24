@@ -30,6 +30,7 @@ type Server struct {
 	cache *Cache
 	dns1  *Upstream
 	dns2  *Upstream
+	dns3  *Upstream
 }
 
 func parseUpstream(upstream string) (*Upstream, error) {
@@ -60,25 +61,46 @@ func parseUpstream(upstream string) (*Upstream, error) {
 func New(cfg *config.Config) (*Server, error) {
 	ub := unbound.New()
 
-	if err := ub.SetOption("tls-cert-bundle", "/etc/ssl/certs/ca-certificates.crt"); err != nil {
-		log.Errorf("unbound tls-cert-bundle: %v", err)
-		return nil, err
-	}
-	if err := ub.SetOption("edns-buffer-size", "1232"); err != nil {
-		log.Errorf("unbound edns-buffer-size: %v", err)
-		return nil, err
-	}
+	// Автоматическое обновление корневых ключей
 	if err := ub.SetOption("auto-trust-anchor-file", "/etc/unbound/root.key"); err != nil {
 		log.Errorf("auto-trust-anchor-file: %v", err)
+		return nil, err
+	}
+	// Настройка DNSSEC
+	if err := ub.SetOption("edns-buffer-size", "1232"); err != nil {
+		log.Errorf("unbound edns-buffer-size: %v", err)
 		return nil, err
 	}
 	if err := ub.SetOption("module-config", "validator iterator"); err != nil {
 		log.Errorf("module-config: %v", err)
 		return nil, err
 	}
-
-	log.Infof("unbound initialized")
-
+	if err := ub.SetOption("harden-dnssec-stripped:", "yes"); err != nil {
+		log.Errorf("harden-dnssec-stripped: %v", err)
+		return nil, err
+	}
+	if err := ub.SetOption("val-clean-additional:", "yes"); err != nil {
+		log.Errorf("val-clean-additional: %v", err)
+		return nil, err
+	}
+	// Настройка кэша
+	if err := ub.SetOption("msg-cache-size:", "100m"); err != nil {
+		log.Errorf("msg-cache-size: %v", err)
+		return nil, err
+	}
+	if err := ub.SetOption("rrset-cache-size:", "200m"); err != nil {
+		log.Errorf("rrset-cache-size: %v", err)
+		return nil, err
+	}
+	if err := ub.SetOption("cache-min-ttl:", "300"); err != nil {
+		log.Errorf("cache-min-ttl: %v", err)
+		return nil, err
+	}
+	if err := ub.SetOption("cache-max-ttl:", "86400"); err != nil {
+		log.Errorf("cache-max-ttl: %v", err)
+		return nil, err
+	}
+	// Парсинг dns строк
 	dns1, err := parseUpstream(cfg.DNS1)
 	if err != nil {
 		log.Errorf("parse upstream [%s] error: %v", cfg.DNS1, err)
@@ -89,6 +111,44 @@ func New(cfg *config.Config) (*Server, error) {
 		log.Errorf("parse upstream [%s] error: %v", cfg.DNS2, err)
 		return nil, err
 	}
+	dns3, err := parseUpstream(cfg.DNS3)
+	if err != nil {
+		log.Errorf("parse upstream [%s] error: %v", cfg.DNS3, err)
+		return nil, err
+	}
+	// Добавление доверенных серверов DNS-over-TLS
+	servers := []string{
+		fmt.Sprintf("%s@%d", dns1.Address, dns1.Port),
+		fmt.Sprintf("%s@%d", dns2.Address, dns2.Port),
+		fmt.Sprintf("%s@%d", dns3.Address, dns3.Port),
+	}
+	// Формирование строки серверов для SetFwd
+	fwdStr := strings.Join(servers, " ")
+	if err := ub.SetFwd(fwdStr); err != nil {
+		log.Errorf("set fwd: %v", err)
+		return nil, err
+	}
+	// Включение DoT для вышестоящих серверов
+	if err := ub.SetOption("tls-upstream:", "yes"); err != nil {
+		log.Errorf("tls-upstream: %v", err)
+		return nil, err
+	}
+	// Настройка TLS параметров
+	if err := ub.SetOption("tls-cert-bundle", "/etc/ssl/certs/ca-certificates.crt"); err != nil {
+		log.Errorf("unbound tls-cert-bundle: %v", err)
+		return nil, err
+	}
+	// Установка таймаутов
+	if err := ub.SetOption("timeout:", "3000"); err != nil {
+		log.Errorf("timeout: %v", err)
+		return nil, err
+	}
+	if err := ub.SetOption("target-fetch-policy:", "2 1 0"); err != nil {
+		log.Errorf("target-fetch-policy: %v", err)
+		return nil, err
+	}
+
+	log.Infof("unbound initialized")
 
 	return &Server{
 		cfg:   cfg,
@@ -96,6 +156,7 @@ func New(cfg *config.Config) (*Server, error) {
 		cache: NewCache(cfg.CacheSize),
 		dns1:  dns1,
 		dns2:  dns2,
+		dns3:  dns3,
 	}, nil
 }
 
