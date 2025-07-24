@@ -12,6 +12,8 @@ FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata mc
 ENV TZ=""
 
+RUN mkdir -p /etc/godns
+
 COPY --from=gobuilder /app/godns /usr/local/bin/godns
 COPY ./config/godns.yaml /etc/godns.yaml
 COPY ./config/default.local /etc/godns/default.local
