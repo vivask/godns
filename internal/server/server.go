@@ -193,17 +193,18 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 
 	start := time.Now()
 	resp, err := s.resolve(ctx, req)
-	if err != nil {
-		log.Warnf("resolve [%s] error: %v", req.Question[0].Name, err)
+	if err != nil || resp.Rcode != dns.RcodeSuccess {
+		if err != nil {
+			log.Warnf("resolve [%s] error: %v", req.Question[0].Name, err)
+		}
 		resp = new(dns.Msg)
 		resp.SetRcode(req, dns.RcodeServerFailure)
+	} else {
+		s.cache.Put(key, resp)
 	}
 
 	resp.Id = req.Id
-	s.cache.Put(key, resp)
-
 	_ = s.send(pc, addr, resp)
-
 	s.logDNSResponse(start, req.Question[0], resp)
 }
 
@@ -265,9 +266,8 @@ func (s *Server) getConn(up *Upstream) *dns.Conn {
 	s.mu.RUnlock()
 
 	if ok && conn != nil {
-		// Проверяем живо ли соединение
-		if err := conn.Conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond)); err != nil {
-			// Соединение мертво, удаляем его
+		// Проверяем живость соединения
+		if !s.isConnAlive(conn, up) {
 			s.mu.Lock()
 			delete(s.conns, up)
 			s.mu.Unlock()
@@ -276,7 +276,6 @@ func (s *Server) getConn(up *Upstream) *dns.Conn {
 	}
 
 	if !ok {
-		// быстрый реконнект
 		conn, err := s.dialUpstream(up)
 		if err != nil {
 			log.Errorf("failed to reconnect to %s: %v", up.DialableAddress, err)
@@ -287,6 +286,25 @@ func (s *Server) getConn(up *Upstream) *dns.Conn {
 		s.mu.Unlock()
 	}
 	return conn
+}
+
+func (s *Server) isConnAlive(conn *dns.Conn, up *Upstream) bool {
+	msg := new(dns.Msg)
+	msg.SetQuestion(".", dns.TypeNS)
+	msg.RecursionDesired = false
+	msg.SetEdns0(512, false)
+
+	client := &dns.Client{
+		Net:         "tcp-tls",
+		DialTimeout: 2 * time.Second,
+		ReadTimeout: 2 * time.Second,
+	}
+
+	_, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, _, err := client.ExchangeWithConn(msg, conn)
+	return err == nil
 }
 
 func (s *Server) send(pc net.PacketConn, addr net.Addr, m *dns.Msg) error {
