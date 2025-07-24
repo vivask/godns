@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -15,7 +16,6 @@ import (
 	"godns/internal/log"
 
 	"github.com/miekg/dns"
-	"github.com/miekg/unbound"
 )
 
 type Upstream struct {
@@ -27,7 +27,6 @@ type Upstream struct {
 
 type Server struct {
 	cfg  *config.Config
-	ub   *unbound.Unbound
 	dns1 *Upstream
 	dns2 *Upstream
 	dns3 *Upstream
@@ -57,15 +56,29 @@ func parseUpstream(upstream string) (*Upstream, error) {
 
 /* ---------- New (сигнатура и вызовы не менялись) ---------- */
 func New(cfg *config.Config) (*Server, error) {
-	ub := unbound.New()
 
-	// Загружаем готовый конфиг-файл
-	if err := ub.Config("/etc/unbound/unbound.conf"); err != nil {
-		return nil, fmt.Errorf("unbound config: %w", err)
+	// Upstream-ы
+	dns1, err := parseUpstream(cfg.DNS1)
+	if err != nil {
+		log.Errorf("parse upstream [%s] error: %v", cfg.DNS1, err)
+		return nil, err
 	}
-
-	log.Infof("unbound initialized from /etc/unbound/unbound.conf")
-	return &Server{cfg: cfg, ub: ub}, nil
+	dns2, err := parseUpstream(cfg.DNS2)
+	if err != nil {
+		log.Errorf("parse upstream [%s] error: %v", cfg.DNS2, err)
+		return nil, err
+	}
+	dns3, err := parseUpstream(cfg.DNS3)
+	if err != nil {
+		log.Errorf("parse upstream [%s] error: %v", cfg.DNS3, err)
+		return nil, err
+	}
+	return &Server{
+		cfg:  cfg,
+		dns1: dns1,
+		dns2: dns2,
+		dns3: dns3,
+	}, nil
 }
 
 /* ---------- Run ---------- */
@@ -149,33 +162,44 @@ func (s *Server) resolveWithDNSSEC(msg *dns.Msg) (*dns.Msg, error) {
 	if len(msg.Question) == 0 {
 		return nil, fmt.Errorf("no question")
 	}
-	q := msg.Question[0]
 
-	result, err := s.ub.Resolve(q.Name, uint16(q.Qtype), uint16(q.Qclass))
-	if err != nil {
-		return nil, err
+	// выбираем upstream
+	up := s.dns1
+	switch time.Now().UnixNano() % 3 {
+	case 1:
+		up = s.dns2
+	case 2:
+		up = s.dns3
 	}
 
-	resp := new(dns.Msg)
-	resp.SetReply(msg)
-	resp.Authoritative = false
-	resp.RecursionAvailable = true
-	resp.RecursionDesired = true
-	resp.CheckingDisabled = false
-
-	if result.Secure {
-		resp.AuthenticatedData = true
+	// DoT-клиент
+	tlsCfg := &tls.Config{
+		ServerName: up.ServerName,
+		MinVersion: tls.VersionTLS13,
 	}
-	if result.NxDomain {
-		resp.Rcode = dns.RcodeNameError
-	} else {
-		resp.Rcode = dns.RcodeSuccess
+	client := &dns.Client{
+		Net:       "tcp-tls",
+		TLSConfig: tlsCfg,
+		Timeout:   s.cfg.Timeout,
 	}
 
-	// result.Rr уже []dns.RR
-	resp.Answer = append(resp.Answer, result.Rr...)
+	// копия запроса
+	req := msg.Copy()
+	req.RecursionDesired = true
+	// просим апстрим проверить DNSSEC
+	opt := req.IsEdns0()
+	if opt == nil {
+		opt = new(dns.OPT)
+		opt.Hdr.Name = "."
+		opt.Hdr.Rrtype = dns.TypeOPT
+		opt.SetUDPSize(1232)
+		req.Extra = append(req.Extra, opt)
+	}
+	// устанавливаем DO (DNSSEC OK)
+	opt.SetDo(true)
 
-	return resp, nil
+	r, _, err := client.Exchange(req, up.DialableAddress)
+	return r, err
 }
 
 /* ---------- sendServfail ---------- */

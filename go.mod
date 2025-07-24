@@ -4,7 +4,6 @@ go 1.24.5
 
 require (
 	github.com/miekg/dns v1.1.67
-	github.com/miekg/unbound v0.0.0-20240613151107-1f0f3b231f04
 	github.com/op/go-logging v0.0.0-20160315200505-970db520ece7
 	golang.org/x/sys v0.33.0
 	gopkg.in/yaml.v3 v3.0.1
