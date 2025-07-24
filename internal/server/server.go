@@ -29,6 +29,7 @@ type Server struct {
 	cache *Cache
 
 	upstreams []*Upstream
+	zone      *Zone
 
 	conns map[*Upstream]*dns.Conn // persistent DoT-коннекты
 	mu    sync.RWMutex
@@ -79,10 +80,18 @@ func New(cfg *config.Config) (*Server, error) {
 	s := &Server{
 		cfg:       cfg,
 		cache:     NewCache(cfg.CacheSize),
+		zone:      NewZone("default.local"), // origin
 		upstreams: []*Upstream{u1, u2, u3},
 		conns:     make(map[*Upstream]*dns.Conn),
 	}
+
+	// загружаем файл зоны
+	if err := s.zone.LoadFromFile("/etc/godns/default.local"); err != nil {
+		log.Errorf("cannot load zone file: %v", err)
+	}
+
 	go s.initConnections()
+
 	return s, nil
 }
 
@@ -191,6 +200,13 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 		return
 	}
 
+	if resp := s.resolveLocal(req); resp != nil {
+		resp.Id = req.Id
+		_ = s.send(pc, addr, resp)
+		log.Debugf("served from zone: addr=%s q=%s", addr, req.Question[0].Name)
+		return
+	}
+
 	start := time.Now()
 	resp, err := s.resolve(ctx, req)
 	if err != nil || resp.Rcode != dns.RcodeSuccess {
@@ -206,6 +222,23 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
 	resp.Id = req.Id
 	_ = s.send(pc, addr, resp)
 	s.logDNSResponse(start, req.Question[0], resp)
+}
+
+func (s *Server) resolveLocal(msg *dns.Msg) *dns.Msg {
+	if len(msg.Question) == 0 {
+		return nil
+	}
+	q := msg.Question[0]
+
+	rrs := s.zone.Match(q.Name, q.Qtype)
+	if len(rrs) == 0 {
+		return nil
+	}
+
+	resp := new(dns.Msg)
+	resp.SetReply(msg)
+	resp.Answer = rrs
+	return resp
 }
 
 func (s *Server) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
