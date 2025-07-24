@@ -60,8 +60,6 @@ func parseUpstream(upstream string) (*Upstream, error) {
 }
 
 func New(cfg *config.Config) (*Server, error) {
-
-	// Парсинг dns строк
 	u1, err := parseUpstream(cfg.DNS1)
 	if err != nil {
 		return nil, err
@@ -75,19 +73,25 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 
+	log.Infof("Configured upstreams: %s, %s, %s",
+		u1.DialableAddress, u2.DialableAddress, u3.DialableAddress)
+
 	s := &Server{
 		cfg:       cfg,
 		cache:     NewCache(cfg.CacheSize),
 		upstreams: []*Upstream{u1, u2, u3},
 		conns:     make(map[*Upstream]*dns.Conn),
 	}
-	go s.initConnections() // стартуем в фоне
+	go s.initConnections()
 	return s, nil
 }
 
 func (s *Server) initConnections() {
 	for _, up := range s.upstreams {
 		go func(u *Upstream) {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+
 			for {
 				conn, err := s.dialUpstream(u)
 				if err != nil {
@@ -95,17 +99,37 @@ func (s *Server) initConnections() {
 					time.Sleep(5 * time.Second)
 					continue
 				}
+
 				s.mu.Lock()
+				if oldConn, ok := s.conns[u]; ok {
+					_ = oldConn.Close()
+				}
 				s.conns[u] = conn
 				s.mu.Unlock()
-				return
+
+				<-ticker.C
 			}
 		}(up)
 	}
 }
 
 func (s *Server) dialUpstream(up *Upstream) (*dns.Conn, error) {
-	tlsCfg := &tls.Config{ServerName: up.ServerName, MinVersion: tls.VersionTLS13}
+	tlsCfg := &tls.Config{
+		ServerName:         up.ServerName,
+		MinVersion:         tls.VersionTLS13,
+		NextProtos:         []string{"dot"},
+		InsecureSkipVerify: false,
+	}
+
+	// Проверяем IPv6 адрес
+	ip := net.ParseIP(up.Address)
+	if ip != nil && ip.To4() == nil {
+		// IPv6 адрес, оборачиваем в []
+		if strings.Count(up.DialableAddress, ":") > 1 {
+			up.DialableAddress = fmt.Sprintf("[%s]:%d", up.Address, up.Port)
+		}
+	}
+
 	tcpConn, err := tls.Dial("tcp", up.DialableAddress, tlsCfg)
 	if err != nil {
 		return nil, err
@@ -239,12 +263,25 @@ func (s *Server) getConn(up *Upstream) *dns.Conn {
 	s.mu.RLock()
 	conn, ok := s.conns[up]
 	s.mu.RUnlock()
-	if ok {
-		return conn
+
+	if ok && conn != nil {
+		// Проверяем живо ли соединение
+		if err := conn.Conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond)); err != nil {
+			// Соединение мертво, удаляем его
+			s.mu.Lock()
+			delete(s.conns, up)
+			s.mu.Unlock()
+			ok = false
+		}
 	}
-	// быстрый реконнект
-	conn, _ = s.dialUpstream(up)
-	if conn != nil {
+
+	if !ok {
+		// быстрый реконнект
+		conn, err := s.dialUpstream(up)
+		if err != nil {
+			log.Errorf("failed to reconnect to %s: %v", up.DialableAddress, err)
+			return nil
+		}
 		s.mu.Lock()
 		s.conns[up] = conn
 		s.mu.Unlock()
