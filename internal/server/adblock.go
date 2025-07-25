@@ -104,9 +104,9 @@ func (ab *Adblock) update() {
 	log.Info("Updating adblock lists...")
 
 	newList := NewBlackList()
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 
-	for _, src := range ab.cfg.Sources {
+	for _, src := range ab.cfg.Adblock.Sources {
 		log.Debugf("Fetching adblock source: %s", src)
 		resp, err := client.Get(src)
 		if err != nil {
@@ -127,13 +127,35 @@ func (ab *Adblock) update() {
 				continue
 			}
 
-			// Пример строки: 0.0.0.0 example.com
-			parts := strings.Fields(line)
-			if len(parts) < 2 {
+			// Обработка формата hosts
+			if strings.Contains(line, "0.0.0.0") || strings.Contains(line, "127.0.0.1") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					domain := dns.CanonicalName(parts[1])
+					newList.Add(domain)
+				}
 				continue
 			}
-			domain := dns.CanonicalName(parts[1])
-			newList.Add(domain)
+
+			// Обработка формата AdGuard/ABP (||domain^)
+			if strings.HasPrefix(line, "||") && strings.Contains(line, "^") {
+				endIdx := strings.Index(line, "^")
+				if endIdx > 2 {
+					domain := line[2:endIdx]
+					// Проверяем, что это действительно домен
+					if strings.Contains(domain, ".") && !strings.Contains(domain, "*") {
+						canonical := dns.CanonicalName(domain)
+						newList.Add(canonical)
+					}
+				}
+				continue
+			}
+
+			// Простые домены (phishing_army_blocklist.txt)
+			if !strings.Contains(line, " ") && strings.Contains(line, ".") {
+				canonical := dns.CanonicalName(line)
+				newList.Add(canonical)
+			}
 		}
 
 		if err := scanner.Err(); err != nil {
@@ -141,7 +163,7 @@ func (ab *Adblock) update() {
 		}
 	}
 
-	// Получаем количество записей до блокировки мьютекса
+	// Получаем количество записей
 	newList.mu.RLock()
 	count := len(newList.data)
 	newList.mu.RUnlock()
