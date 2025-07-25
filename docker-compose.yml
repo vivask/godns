@@ -20,3 +20,6 @@ services:
     dns:
       - 1.1.1.1
       - 8.8.8.8
+    sysctls:
+      - net.core.rmem_max=7500000
+      - net.core.wmem_max=7500000
