@@ -166,13 +166,16 @@ func (s *Server) handleUDP(pc net.PacketConn, addr net.Addr, b []byte) {
 	}
 
 	// 1) Локальная зона
+	log.Debugf("🔍 Local zone check: %s", q.Question[0].Name)
 	if rrs := s.zone.Match(q.Question[0].Name, q.Question[0].Qtype); len(rrs) > 0 {
-		log.Debugf("🎯 Local zone hit: %s", q.Question[0].Name)
+		log.Debugf("🎯 Local zone hit: %s → %v", q.Question[0].Name, rrs)
 		resp := new(dns.Msg)
 		resp.SetReply(q)
 		resp.Authoritative = true
 		resp.Answer = rrs
-		s.writeUDP(resp, addr)
+		if err := s.writeUDP(resp, addr); err != nil {
+			log.Errorf("write local: %v", err)
+		}
 		return
 	}
 
