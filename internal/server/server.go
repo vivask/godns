@@ -82,18 +82,35 @@ func (u *upstream) refreshCert() error {
 }
 
 func (s *Server) Run() error {
-	udpAddr, err := net.ResolveUDPAddr("udp", s.cfg.Listen)
+	pc, err := net.ListenPacket("udp", s.cfg.Listen)
 	if err != nil {
 		return err
 	}
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return err
-	}
-	s.conn = conn
-	log.Infof("dns server listening on %s", s.cfg.Listen)
 
-	// горутина обновления сертификатов
+	// Приведём к *net.UDPConn, чтобы выставить буферы и опции
+	udpConn, ok := pc.(*net.UDPConn)
+	if !ok {
+		return fmt.Errorf("expected *net.UDPConn, got %T", pc)
+	}
+
+	// SO_REUSEPORT (по желанию)
+	if err := setReusePort(udpConn); err != nil {
+		log.Warnf("SO_REUSEPORT not supported: %v", err)
+	}
+
+	// Буферы 1 МБ
+	if err := udpConn.SetReadBuffer(1 << 20); err != nil {
+		return fmt.Errorf("set read buffer: %w", err)
+	}
+	if err := udpConn.SetWriteBuffer(1 << 20); err != nil {
+		return fmt.Errorf("set write buffer: %w", err)
+	}
+
+	// Сохраняем соединение
+	s.conn = udpConn
+	log.Infof("listening: addr=%s", s.cfg.Listen)
+
+	// Горутина обновления сертификатов
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -113,24 +130,24 @@ func (s *Server) Run() error {
 		}
 	}()
 
-	// обработка UDP
-	buf := make([]byte, 512)
+	// Основной цикл приёма пакетов
 	for {
-		n, clientAddr, err := conn.ReadFromUDP(buf)
+		buf := make([]byte, dns.MaxMsgSize)
+		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
 			select {
 			case <-s.closeCh:
 				return nil
 			default:
-				log.Errorf("read udp: %v", err)
+				log.Errorf("read error: %v", err)
 				continue
 			}
 		}
-		go s.handleUDP(buf[:n], clientAddr)
+		go s.handleUDP(pc, addr, buf[:n])
 	}
 }
 
-func (s *Server) handleUDP(b []byte, addr *net.UDPAddr) {
+func (s *Server) handleUDP(pc net.PacketConn, addr net.Addr, b []byte) {
 	start := time.Now()
 	log.Debugf("📥 UDP packet received from %s (%d bytes)", addr.String(), len(b))
 
@@ -213,9 +230,13 @@ func (s *Server) doHQuery(u *upstream, q *dns.Msg) (*dns.Msg, error) {
 	return answer, nil
 }
 
-func (s *Server) writeUDP(m *dns.Msg, addr *net.UDPAddr) {
-	b, _ := m.Pack()
-	_, _ = s.conn.WriteToUDP(b, addr)
+func (s *Server) writeUDP(m *dns.Msg, addr net.Addr) error {
+	b, err := m.Pack()
+	if err != nil {
+		return err
+	}
+	_, err = s.conn.WriteTo(b, addr)
+	return err
 }
 
 func (s *Server) Stop() error {
