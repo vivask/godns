@@ -17,3 +17,6 @@ services:
     restart: unless-stopped
     environment:
       TZ: "Europe/Minsk"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
