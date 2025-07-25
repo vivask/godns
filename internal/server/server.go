@@ -34,6 +34,7 @@ type Server struct {
 	conn    *net.UDPConn
 	wg      sync.WaitGroup
 	closeCh chan struct{}
+	zone    *Zone
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -42,6 +43,12 @@ func New(cfg *config.Config) (*Server, error) {
 		cache:   NewCache(cfg.CacheSize),
 		closeCh: make(chan struct{}),
 	}
+
+	// загрузить локальную зону
+	if err := s.zone.LoadFromFile("/etc/godns/default.local"); err != nil {
+		log.Warnf("local zone load: %v", err)
+	}
+
 	// инициализируем upstream-ы
 	for _, u := range []string{cfg.UP1, cfg.UP2, cfg.UP3} {
 		ups := &upstream{url: u}
@@ -157,10 +164,21 @@ func (s *Server) handleUDP(pc net.PacketConn, addr net.Addr, b []byte) {
 		return
 	}
 
+	// 1) Локальная зона
+	if rrs := s.zone.Match(q.Question[0].Name, q.Question[0].Qtype); len(rrs) > 0 {
+		log.Debugf("🎯 Local zone hit: %s", q.Question[0].Name)
+		resp := new(dns.Msg)
+		resp.SetReply(q)
+		resp.Authoritative = true
+		resp.Answer = rrs
+		s.writeUDP(resp, addr)
+		return
+	}
+
 	key := q.Question[0].String()
 	log.Debugf("🔍 Query: %s", key)
 
-	// Проверка кэша
+	// 2) Проверка кэша
 	if cached, ok := s.cache.Get(key); ok {
 		cached.Id = q.Id
 		s.writeUDP(cached, addr)
@@ -169,7 +187,7 @@ func (s *Server) handleUDP(pc net.PacketConn, addr net.Addr, b []byte) {
 	}
 	log.Debugf("🔄 Cache miss, forwarding upstream")
 
-	// Пробуем upstream-ы
+	// 3) Пробуем upstream-ы
 	for i, ups := range s.ups {
 		log.Debugf("🚀 Trying upstream[%d]: %s", i, ups.url)
 		for attempt := 0; attempt < 3; attempt++ {
