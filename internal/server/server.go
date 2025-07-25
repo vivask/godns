@@ -42,6 +42,7 @@ func New(cfg *config.Config) (*Server, error) {
 		cfg:     cfg,
 		cache:   NewCache(cfg.CacheSize),
 		closeCh: make(chan struct{}),
+		zone:    NewZone(""),
 	}
 
 	// загрузить локальную зону
