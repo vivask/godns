@@ -15,6 +15,12 @@ type Config struct {
 	CacheSize int           `yaml:"cache_size"`
 	Timeout   time.Duration `yaml:"timeout"`
 	LogLevel  string        `yaml:"log_level"`
+	Adblock   struct {
+		Enable  bool
+		Update  string
+		Time    string
+		Sources []string
+	}
 }
 
 func Load(path string) (*Config, error) {

@@ -39,6 +39,7 @@ type Server struct {
 	zone    *Zone
 	upsMu   sync.Mutex
 	nextIdx int
+	adblock *Adblock
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -47,6 +48,11 @@ func New(cfg *config.Config) (*Server, error) {
 		cache:   NewCache(cfg.CacheSize),
 		closeCh: make(chan struct{}),
 		zone:    NewZone(""),
+	}
+
+	if cfg.Adblock.Enable {
+		s.adblock = NewAdblock(cfg)
+		s.adblock.Start()
 	}
 
 	// загрузить локальную зону
@@ -155,7 +161,7 @@ func (s *Server) Run() error {
 				continue
 			}
 		}
-		go s.handleUDP(pc, addr, buf[:n])
+		go s.handleUDP(addr, buf[:n])
 	}
 }
 
@@ -175,7 +181,7 @@ func (s *Server) pickUpstream() *upstream {
 	return s.ups[0]
 }
 
-func (s *Server) handleUDP(pc net.PacketConn, addr net.Addr, b []byte) {
+func (s *Server) handleUDP(addr net.Addr, b []byte) {
 	start := time.Now()
 	log.Debugf("📥 UDP packet received from %s (%d bytes)", addr.String(), len(b))
 
@@ -222,7 +228,17 @@ func (s *Server) handleUDP(pc net.PacketConn, addr net.Addr, b []byte) {
 	}
 	log.Debugf("🔄 Cache miss, forwarding upstream")
 
-	// 3) Пробуем upstream-ы
+	// 3) Проверка на блокировку
+	if s.adblock != nil && s.adblock.IsBlocked(name) {
+		resp := new(dns.Msg)
+		resp.SetReply(q)
+		resp.Rcode = dns.RcodeNameError // NXDOMAIN
+		s.writeUDP(resp, addr)
+		log.Debugf("🚫 Blocked by adblock: %s", name)
+		return
+	}
+
+	// 4) Пробуем upstream-ы
 	for i, ups := range s.ups {
 		log.Debugf("🚀 Trying upstream[%d]: %s", i, ups.url)
 		for attempt := 0; attempt < 3; attempt++ {

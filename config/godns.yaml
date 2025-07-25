@@ -5,3 +5,13 @@ up3:          "https://dns.quad9.net/dns-query"
 cache_size:   10000     # записей
 timeout:      2s
 log_level:    debug
+adblock:
+  enable:     yes
+  update:     24h
+  time:       03:00:00
+  sources:
+    - https://someonewhocares.org/hosts/zero/hosts
+    - https://adaway.org/hosts.txt
+    - https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext
+    - https://cdn.jsdelivr.net/gh/evankrob/hosts-filenetrehost@master/ad_servers.txt
+    - https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
