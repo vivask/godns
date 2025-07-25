@@ -13,6 +13,7 @@ import (
 	"godns/internal/log"
 
 	"github.com/miekg/dns"
+	"golang.org/x/net/idna"
 )
 
 const (
@@ -127,34 +128,41 @@ func (ab *Adblock) update() {
 				continue
 			}
 
+			var domain string
+
 			// Обработка формата hosts
 			if strings.Contains(line, "0.0.0.0") || strings.Contains(line, "127.0.0.1") {
 				parts := strings.Fields(line)
 				if len(parts) >= 2 {
-					domain := dns.CanonicalName(parts[1])
-					newList.Add(domain)
+					domain = parts[1]
 				}
-				continue
-			}
-
-			// Обработка формата AdGuard/ABP (||domain^)
-			if strings.HasPrefix(line, "||") && strings.Contains(line, "^") {
+			} else if strings.HasPrefix(line, "||") && strings.Contains(line, "^") {
+				// Обработка формата AdGuard/ABP (||domain^)
 				endIdx := strings.Index(line, "^")
 				if endIdx > 2 {
-					domain := line[2:endIdx]
-					// Проверяем, что это действительно домен
-					if strings.Contains(domain, ".") && !strings.Contains(domain, "*") {
-						canonical := dns.CanonicalName(domain)
-						newList.Add(canonical)
-					}
+					domain = line[2:endIdx]
 				}
-				continue
+			} else if !strings.Contains(line, " ") && strings.Contains(line, ".") {
+				// Простые домены (phishing_army_blocklist.txt)
+				domain = line
 			}
 
-			// Простые домены (phishing_army_blocklist.txt)
-			if !strings.Contains(line, " ") && strings.Contains(line, ".") {
-				canonical := dns.CanonicalName(line)
-				newList.Add(canonical)
+			// Если домен найден, обрабатываем его
+			if domain != "" {
+				// Конвертируем домен в ASCII (punycode)
+				asciiDomain, err := idna.ToASCII(domain)
+				if err != nil {
+					log.Debugf("Failed to convert domain to ASCII (punycode): %s, error: %v", domain, err)
+					continue
+				}
+
+				// Проверяем, что это действительно домен (содержит точку и не содержит недопустимых символов)
+				if strings.Contains(asciiDomain, ".") &&
+					!strings.Contains(asciiDomain, "*") &&
+					!strings.Contains(asciiDomain, "/") {
+					canonical := dns.CanonicalName(asciiDomain)
+					newList.Add(canonical)
+				}
 			}
 		}
 
