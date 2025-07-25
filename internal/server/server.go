@@ -227,6 +227,15 @@ func (s *Server) doHQuery(u *upstream, q *dns.Msg) (*dns.Msg, error) {
 	reqStart := time.Now()
 	log.Debugf("📤 Sending DoH request to %s", u.url)
 
+	q = q.Copy()
+	// добавляем EDNS0 OPT с DO=1
+	opt := new(dns.OPT)
+	opt.Hdr.Name = "."
+	opt.Hdr.Rrtype = dns.TypeOPT
+	opt.SetUDPSize(dns.DefaultMsgSize)
+	opt.SetDo(true)
+	q.Extra = append(q.Extra, opt)
+
 	pack, err := q.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("pack failed: %w", err)
