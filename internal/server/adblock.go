@@ -106,7 +106,7 @@ func (ab *Adblock) update() {
 	newList := NewBlackList()
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	for _, src := range ab.cfg.Adblock.Sources {
+	for _, src := range ab.cfg.Sources {
 		log.Debugf("Fetching adblock source: %s", src)
 		resp, err := client.Get(src)
 		if err != nil {
@@ -141,9 +141,14 @@ func (ab *Adblock) update() {
 		}
 	}
 
+	// Получаем количество записей до блокировки мьютекса
+	newList.mu.RLock()
+	count := len(newList.data)
+	newList.mu.RUnlock()
+
 	ab.blacklist = newList
 	ab.saveToFile()
-	log.Info("Adblock list updated")
+	log.Infof("Adblock list updated: %d entries", count)
 }
 
 func (ab *Adblock) saveToFile() {
