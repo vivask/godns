@@ -25,6 +25,8 @@ type upstream struct {
 	certPool   *x509.CertPool
 	lastUpdate time.Time
 	mu         sync.RWMutex
+	lastFail   time.Time
+	failCount  int
 }
 
 type Server struct {
@@ -35,6 +37,8 @@ type Server struct {
 	wg      sync.WaitGroup
 	closeCh chan struct{}
 	zone    *Zone
+	upsMu   sync.Mutex
+	nextIdx int
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -155,6 +159,22 @@ func (s *Server) Run() error {
 	}
 }
 
+// выбираем живой upstream (без цикла)
+func (s *Server) pickUpstream() *upstream {
+	s.upsMu.Lock()
+	defer s.upsMu.Unlock()
+
+	now := time.Now()
+	for _, u := range s.ups {
+		if now.Sub(u.lastFail) < 30*time.Second {
+			continue // недавно упал
+		}
+		return u
+	}
+	// fallback к первому
+	return s.ups[0]
+}
+
 func (s *Server) handleUDP(pc net.PacketConn, addr net.Addr, b []byte) {
 	start := time.Now()
 	log.Debugf("📥 UDP packet received from %s (%d bytes)", addr.String(), len(b))
@@ -206,17 +226,18 @@ func (s *Server) handleUDP(pc net.PacketConn, addr net.Addr, b []byte) {
 	for i, ups := range s.ups {
 		log.Debugf("🚀 Trying upstream[%d]: %s", i, ups.url)
 		for attempt := 0; attempt < 3; attempt++ {
-			respStart := time.Now()
+			ups := s.pickUpstream()
 			resp, err := s.doHQuery(ups, q)
-			log.Debugf("⏱️  doHQuery[%d][attempt %d] took %v", i, attempt+1, time.Since(respStart))
 			if err == nil && resp != nil && resp.Rcode == dns.RcodeSuccess {
+				ups.failCount = 0
 				s.cache.Put(key, resp)
 				resp.Id = q.Id
 				s.writeUDP(resp, addr)
-				log.Debugf("✅ Upstream[%d] responded successfully in %v", i, time.Since(start))
 				return
 			}
-			log.Debugf("❌ Upstream[%d][attempt %d] failed: %v", i, attempt+1, err)
+			ups.lastFail = time.Now()
+			ups.failCount++
+			log.Debugf("❌ %s failed (attempt %d): %v", ups.url, attempt+1, err)
 		}
 	}
 
