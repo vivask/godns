@@ -21,3 +21,6 @@ services:
     dns:
       - 1.1.1.1
       - 8.8.8.8
+volumes:
+  ad-data:
+    driver: local
