@@ -9,9 +9,9 @@ import (
 
 type Config struct {
 	Listen    string        `yaml:"listen"`
-	DNS1      string        `yaml:"dns1"`
-	DNS2      string        `yaml:"dns2"`
-	DNS3      string        `yaml:"dns3"`
+	UP1       string        `yaml:"up1"`
+	UP2       string        `yaml:"up2"`
+	UP3       string        `yaml:"up3"`
 	CacheSize int           `yaml:"cache_size"`
 	Timeout   time.Duration `yaml:"timeout"`
 	LogLevel  string        `yaml:"log_level"`

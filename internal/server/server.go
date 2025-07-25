@@ -3,11 +3,11 @@ package server
 import (
 	"context"
 	"crypto/tls"
-	"errors"
+	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"net"
-	"strconv"
-	"strings"
+	"net/http"
 	"sync"
 	"time"
 
@@ -15,382 +15,193 @@ import (
 	"godns/internal/log"
 
 	"github.com/miekg/dns"
+	"github.com/quic-go/quic-go/http3"
 )
 
-type Upstream struct {
-	ServerName      string
-	Address         string
-	Port            int
-	DialableAddress string
+type upstream struct {
+	url        string
+	client     *http.Client
+	certPool   *x509.CertPool
+	lastUpdate time.Time
+	mu         sync.RWMutex
 }
 
 type Server struct {
-	cfg   *config.Config
-	cache *Cache
-
-	upstreams []*Upstream
-	zone      *Zone
-
-	conns map[*Upstream]*dns.Conn // persistent DoT-коннекты
-	mu    sync.RWMutex
-}
-
-func parseUpstream(upstream string) (*Upstream, error) {
-	// server:port@address
-	parts := strings.SplitN(upstream, "@", 2)
-	if len(parts) != 2 {
-		return nil, errors.New("upstream must be in format server:port@address")
-	}
-
-	hostPort := strings.SplitN(parts[0], ":", 2)
-	if len(hostPort) != 2 {
-		return nil, errors.New("server part must be in format host:port")
-	}
-
-	port, err := strconv.Atoi(hostPort[1])
-	if err != nil {
-		return nil, errors.New("port must be integer")
-	}
-
-	return &Upstream{
-		ServerName:      hostPort[0],
-		Address:         parts[1],
-		Port:            port,
-		DialableAddress: fmt.Sprintf("%s:%d", parts[1], port),
-	}, nil
+	cfg     *config.Config
+	cache   *Cache
+	ups     []*upstream
+	conn    *net.UDPConn
+	wg      sync.WaitGroup
+	closeCh chan struct{}
 }
 
 func New(cfg *config.Config) (*Server, error) {
-	u1, err := parseUpstream(cfg.DNS1)
-	if err != nil {
-		return nil, err
-	}
-	u2, err := parseUpstream(cfg.DNS2)
-	if err != nil {
-		return nil, err
-	}
-	u3, err := parseUpstream(cfg.DNS3)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Infof("Configured upstreams: %s, %s, %s",
-		u1.DialableAddress, u2.DialableAddress, u3.DialableAddress)
-
+	log.SetLogger("server", cfg.LogLevel)
 	s := &Server{
-		cfg:       cfg,
-		cache:     NewCache(cfg.CacheSize),
-		zone:      NewZone("default.local"), // origin
-		upstreams: []*Upstream{u1, u2, u3},
-		conns:     make(map[*Upstream]*dns.Conn),
+		cfg:     cfg,
+		cache:   NewCache(cfg.CacheSize),
+		closeCh: make(chan struct{}),
 	}
-
-	// загружаем файл зоны
-	if err := s.zone.LoadFromFile("/etc/godns/default.local"); err != nil {
-		log.Errorf("cannot load zone file: %v", err)
+	// инициализируем upstream-ы
+	for _, u := range []string{cfg.UP1, cfg.UP2, cfg.UP3} {
+		ups := &upstream{url: u}
+		if err := ups.refreshCert(); err != nil {
+			log.Warnf("initial cert refresh for %s: %v", u, err)
+		}
+		s.ups = append(s.ups, ups)
 	}
-
-	go s.initConnections()
-
 	return s, nil
 }
 
-func (s *Server) initConnections() {
-	for _, up := range s.upstreams {
-		go func(u *Upstream) {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
+func (u *upstream) refreshCert() error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 
-			for {
-				conn, err := s.dialUpstream(u)
-				if err != nil {
-					log.Errorf("health-check %s: %v", u.DialableAddress, err)
-					time.Sleep(5 * time.Second)
-					continue
-				}
-
-				s.mu.Lock()
-				if oldConn, ok := s.conns[u]; ok {
-					_ = oldConn.Close()
-				}
-				s.conns[u] = conn
-				s.mu.Unlock()
-
-				<-ticker.C
-			}
-		}(up)
-	}
-}
-
-func (s *Server) dialUpstream(up *Upstream) (*dns.Conn, error) {
-	tlsCfg := &tls.Config{
-		ServerName:         up.ServerName,
-		MinVersion:         tls.VersionTLS13,
-		NextProtos:         []string{"dot"},
-		InsecureSkipVerify: false,
-	}
-
-	// Проверяем IPv6 адрес
-	ip := net.ParseIP(up.Address)
-	if ip != nil && ip.To4() == nil {
-		// IPv6 адрес, оборачиваем в []
-		if strings.Count(up.DialableAddress, ":") > 1 {
-			up.DialableAddress = fmt.Sprintf("[%s]:%d", up.Address, up.Port)
-		}
-	}
-
-	tcpConn, err := tls.Dial("tcp", up.DialableAddress, tlsCfg)
-	if err != nil {
-		return nil, err
-	}
-	return &dns.Conn{Conn: tcpConn}, nil
-}
-
-func (s *Server) Run() error {
-	pc, err := net.ListenPacket("udp", s.cfg.Listen)
-	if err != nil {
-		return err
-	}
-
-	// SO_REUSEPORT при желании
-	if udpConn, ok := pc.(*net.UDPConn); ok {
-		if err := setReusePort(udpConn); err != nil {
-			log.Warnf("SO_REUSEPORT not supported: %v", err)
-		}
-	}
-
-	// 1 MB read buffer
-	if err := pc.(*net.UDPConn).SetReadBuffer(1 << 20); err != nil {
-		return err
-	}
-	if err := pc.(*net.UDPConn).SetWriteBuffer(1 << 20); err != nil {
-		return err
-	}
-
-	log.Infof("listening: addr=%s", s.cfg.Listen)
-	for {
-		buf := make([]byte, dns.MaxMsgSize)
-		n, addr, err := pc.ReadFrom(buf)
-		if err != nil {
-			log.Errorf("read error: %v", err)
-			continue
-		}
-		go s.handle(pc, addr, buf[:n])
-	}
-}
-
-func (s *Server) handle(pc net.PacketConn, addr net.Addr, buf []byte) {
-	req := new(dns.Msg)
-	if err := req.Unpack(buf); err != nil {
-		log.Debugf("malformed packet: err=%v addr=%s", err, addr)
-		return
-	}
-	if len(req.Question) == 0 {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.Timeout)
-	defer cancel()
-
-	key := cacheKey(req)
-	if resp, ok := s.cache.Get(key); ok {
-		resp.Id = req.Id
-		_ = s.send(pc, addr, resp)
-		log.Debugf("served from cache: addr=%s q=%s", addr, req.Question[0].Name)
-		return
-	}
-
-	if resp := s.resolveLocal(req); resp != nil {
-		resp.Id = req.Id
-		_ = s.send(pc, addr, resp)
-		log.Debugf("served from zone: addr=%s q=%s", addr, req.Question[0].Name)
-		return
-	}
-
-	start := time.Now()
-	resp, err := s.resolve(ctx, req)
-	if err != nil || resp.Rcode != dns.RcodeSuccess {
-		if err != nil {
-			log.Warnf("resolve [%s] error: %v", req.Question[0].Name, err)
-		}
-		resp = new(dns.Msg)
-		resp.SetRcode(req, dns.RcodeServerFailure)
-	} else {
-		s.cache.Put(key, resp)
-	}
-
-	resp.Id = req.Id
-	_ = s.send(pc, addr, resp)
-	s.logDNSResponse(start, req.Question[0], resp)
-}
-
-func (s *Server) resolveLocal(msg *dns.Msg) *dns.Msg {
-	if len(msg.Question) == 0 {
+	if time.Since(u.lastUpdate) < 24*time.Hour {
 		return nil
 	}
-	q := msg.Question[0]
 
-	// 1. имя как есть
-	// 2. имя + origin
-	candidates := []string{
-		dns.CanonicalName(q.Name),
-		dns.CanonicalName(q.Name + "." + s.zone.origin),
+	rootCAs, err := x509.SystemCertPool()
+	if err != nil {
+		rootCAs = x509.NewCertPool()
 	}
+	u.certPool = rootCAs
 
-	for _, name := range candidates {
-		rrs := s.zone.Match(name, q.Qtype)
-		if len(rrs) == 0 {
-			continue
-		}
-		resp := new(dns.Msg)
-		resp.SetReply(msg)
-		resp.Answer = rrs
-		return resp
+	roundTripper := &http3.Transport{
+		TLSClientConfig: &tls.Config{
+			RootCAs: u.certPool,
+		},
 	}
+	u.client = &http.Client{
+		Transport: roundTripper,
+		Timeout:   5 * time.Second,
+	}
+	u.lastUpdate = time.Now()
+	log.Infof("refreshed cert pool for %s", u.url)
 	return nil
 }
 
-func (s *Server) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
-	up := s.pickUpstream()
-	conn := s.getConn(up)
-	if conn == nil {
-		return nil, fmt.Errorf("no connection to %s", up.DialableAddress)
-	}
-
-	req := msg.Copy()
-	req.RecursionDesired = true
-
-	// просим апстрим проверить DNSSEC
-	opt := req.IsEdns0()
-	if opt == nil {
-		opt = new(dns.OPT)
-		opt.Hdr.Name = "."
-		opt.Hdr.Rrtype = dns.TypeOPT
-		opt.SetUDPSize(1232)
-		req.Extra = append(req.Extra, opt)
-	}
-	// устанавливаем DO (DNSSEC OK)
-	opt.SetDo(true)
-
-	// Оборачиваем ExchangeWithConn в мьютекс
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// Создаем клиент только для этого вызова
-	client := &dns.Client{
-		Net:         "tcp-tls",
-		DialTimeout: s.cfg.Timeout,
-		ReadTimeout: s.cfg.Timeout,
-	}
-
-	resp, _, err := client.ExchangeWithConn(req, conn)
-	return resp, err
-}
-
-// ---------- pickUpstream ----------
-func (s *Server) pickUpstream() *Upstream {
-	// round-robin
-	n := time.Now().UnixNano()
-	switch int(n % 3) {
-	case 0:
-		return s.upstreams[0]
-	case 1:
-		return s.upstreams[1]
-	default:
-		return s.upstreams[2]
-	}
-}
-
-// ---------- getConn ----------
-func (s *Server) getConn(up *Upstream) *dns.Conn {
-	s.mu.RLock()
-	conn, ok := s.conns[up]
-	s.mu.RUnlock()
-
-	if ok && conn != nil {
-		// Проверяем живость соединения
-		if !s.isConnAlive(conn, up) {
-			s.mu.Lock()
-			delete(s.conns, up)
-			s.mu.Unlock()
-			ok = false
-		}
-	}
-
-	if !ok {
-		conn, err := s.dialUpstream(up)
-		if err != nil {
-			log.Errorf("failed to reconnect to %s: %v", up.DialableAddress, err)
-			return nil
-		}
-		s.mu.Lock()
-		s.conns[up] = conn
-		s.mu.Unlock()
-	}
-	return conn
-}
-
-func (s *Server) isConnAlive(conn *dns.Conn, up *Upstream) bool {
-	msg := new(dns.Msg)
-	msg.SetQuestion(".", dns.TypeNS)
-	msg.RecursionDesired = false
-	msg.SetEdns0(512, false)
-
-	client := &dns.Client{
-		Net:         "tcp-tls",
-		DialTimeout: 2 * time.Second,
-		ReadTimeout: 2 * time.Second,
-	}
-
-	_, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	_, _, err := client.ExchangeWithConn(msg, conn)
-	return err == nil
-}
-
-func (s *Server) send(pc net.PacketConn, addr net.Addr, m *dns.Msg) error {
-	buf, err := m.Pack()
+func (s *Server) Run() error {
+	udpAddr, err := net.ResolveUDPAddr("udp", s.cfg.Listen)
 	if err != nil {
 		return err
 	}
-	_, err = pc.WriteTo(buf, addr)
-	return err
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return err
+	}
+	s.conn = conn
+	log.Infof("dns server listening on %s", s.cfg.Listen)
+
+	// горутина обновления сертификатов
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				for _, u := range s.ups {
+					if err := u.refreshCert(); err != nil {
+						log.Warnf("cert refresh: %v", err)
+					}
+				}
+			case <-s.closeCh:
+				return
+			}
+		}
+	}()
+
+	// обработка UDP
+	buf := make([]byte, 512)
+	for {
+		n, clientAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			select {
+			case <-s.closeCh:
+				return nil
+			default:
+				log.Errorf("read udp: %v", err)
+				continue
+			}
+		}
+		go s.handleUDP(buf[:n], clientAddr)
+	}
 }
 
-func cacheKey(m *dns.Msg) string {
-	if len(m.Question) == 0 {
-		return ""
+func (s *Server) handleUDP(b []byte, addr *net.UDPAddr) {
+	q := new(dns.Msg)
+	if err := q.Unpack(b); err != nil {
+		log.Warnf("unpack request: %v", err)
+		return
 	}
-	q := m.Question[0]
-	return fmt.Sprintf("%s|%d|%d", q.Name, q.Qtype, q.Qclass)
+
+	key := q.Question[0].String()
+	if cached, ok := s.cache.Get(key); ok {
+		cached.Id = q.Id
+		s.writeUDP(cached, addr)
+		return
+	}
+
+	for i := 0; i < len(s.ups); i++ {
+		ups := s.ups[i]
+		var resp *dns.Msg
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			resp, err = s.doHQuery(ups, q)
+			if err == nil && resp != nil && resp.Rcode == dns.RcodeSuccess {
+				break
+			}
+			log.Debugf("attempt %d for %s failed: %v", attempt+1, ups.url, err)
+			time.Sleep(100 * time.Millisecond)
+		}
+		if err == nil && resp != nil {
+			s.cache.Put(key, resp)
+			resp.Id = q.Id
+			s.writeUDP(resp, addr)
+			return
+		}
+		// канал упал → запускаем обновление в фоне
+		go ups.refreshCert()
+	}
+	log.Warnf("all upstreams failed for %s", key)
 }
 
-type timeWriter struct{}
+func (s *Server) doHQuery(u *upstream, q *dns.Msg) (*dns.Msg, error) {
+	u.mu.RLock()
+	client := u.client
+	u.mu.RUnlock()
 
-func (w *timeWriter) Write(p []byte) (int, error) {
-	return fmt.Printf("%s %s", time.Now().Format(time.RFC3339), p)
+	if client == nil {
+		return nil, fmt.Errorf("no client")
+	}
+
+	// DoH JSON
+	jsonURL := fmt.Sprintf("%s?name=%s&type=%d", u.url, q.Question[0].Name, q.Question[0].Qtype)
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", jsonURL, nil)
+	req.Header.Set("Accept", "application/dns-json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var doh dns.Msg
+	if err := json.NewDecoder(resp.Body).Decode(&doh); err != nil {
+		return nil, err
+	}
+	return &doh, nil
 }
 
-func (s *Server) logDNSResponse(start time.Time, q dns.Question, resp *dns.Msg) {
-	duration := time.Since(start)
-	status := "INSECURE"
-	if resp.AuthenticatedData {
-		status = "SECURE"
-	}
+func (s *Server) writeUDP(m *dns.Msg, addr *net.UDPAddr) {
+	b, _ := m.Pack()
+	_, _ = s.conn.WriteToUDP(b, addr)
+}
 
-	answers := len(resp.Answer)
-	if resp.Rcode != dns.RcodeSuccess {
-		status = dns.RcodeToString[resp.Rcode]
-	}
-
-	log.Debugf(
-		"[%s] %s %s %s → %d answers in %v\n",
-		status,
-		dns.TypeToString[q.Qtype],
-		q.Name,
-		dns.ClassToString[q.Qclass],
-		answers,
-		duration,
-	)
+func (s *Server) Stop() error {
+	close(s.closeCh)
+	_ = s.conn.Close()
+	s.wg.Wait()
+	return nil
 }

@@ -2,6 +2,9 @@ package main
 
 import (
 	"flag"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"godns/internal/config"
 	"godns/internal/log"
@@ -24,7 +27,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("cannot create server: %v", err)
 	}
-	if err := srv.Run(); err != nil {
-		log.Fatalf("cannot run server: %v", err)
+
+	go func() {
+		if err := srv.Run(); err != nil {
+			log.Fatalf("run: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+	if err := srv.Stop(); err != nil {
+		log.Fatalf("stop: %v", err)
 	}
 }
