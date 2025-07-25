@@ -131,84 +131,85 @@ func (s *Server) Run() error {
 }
 
 func (s *Server) handleUDP(b []byte, addr *net.UDPAddr) {
+	start := time.Now()
+	log.Debugf("📥 UDP packet received from %s (%d bytes)", addr.String(), len(b))
+
 	q := new(dns.Msg)
 	if err := q.Unpack(b); err != nil {
-		log.Warnf("unpack request: %v", err)
+		log.Warnf("❌ Failed to unpack DNS query: %v", err)
 		return
 	}
 
 	key := q.Question[0].String()
+	log.Debugf("🔍 Query: %s", key)
+
+	// Проверка кэша
 	if cached, ok := s.cache.Get(key); ok {
 		cached.Id = q.Id
 		s.writeUDP(cached, addr)
+		log.Debugf("✅ Cache hit, answered in %v", time.Since(start))
 		return
 	}
+	log.Debugf("🔄 Cache miss, forwarding upstream")
 
-	for i := 0; i < len(s.ups); i++ {
-		ups := s.ups[i]
-		var resp *dns.Msg
-		var err error
+	// Пробуем upstream-ы
+	for i, ups := range s.ups {
+		log.Debugf("🚀 Trying upstream[%d]: %s", i, ups.url)
 		for attempt := 0; attempt < 3; attempt++ {
-			resp, err = s.doHQuery(ups, q)
+			respStart := time.Now()
+			resp, err := s.doHQuery(ups, q)
+			log.Debugf("⏱️  doHQuery[%d][attempt %d] took %v", i, attempt+1, time.Since(respStart))
 			if err == nil && resp != nil && resp.Rcode == dns.RcodeSuccess {
-				break
+				s.cache.Put(key, resp)
+				resp.Id = q.Id
+				s.writeUDP(resp, addr)
+				log.Debugf("✅ Upstream[%d] responded successfully in %v", i, time.Since(start))
+				return
 			}
-			log.Debugf("attempt %d for %s failed: %v", attempt+1, ups.url, err)
-			time.Sleep(100 * time.Millisecond)
+			log.Debugf("❌ Upstream[%d][attempt %d] failed: %v", i, attempt+1, err)
 		}
-		if err == nil && resp != nil {
-			s.cache.Put(key, resp)
-			resp.Id = q.Id
-			s.writeUDP(resp, addr)
-			return
-		}
-		// канал упал → запускаем обновление в фоне
-		go ups.refreshCert()
 	}
-	log.Warnf("all upstreams failed for %s", key)
+
+	log.Warnf("🛑 All upstreams failed for %s, took %v", key, time.Since(start))
 }
 
 func (s *Server) doHQuery(u *upstream, q *dns.Msg) (*dns.Msg, error) {
-	u.mu.RLock()
-	client := u.client
-	u.mu.RUnlock()
+	reqStart := time.Now()
+	log.Debugf("📤 Sending DoH request to %s", u.url)
 
-	if client == nil {
-		return nil, fmt.Errorf("no client")
-	}
-
-	// Сериализуем запрос
 	pack, err := q.Pack()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("pack failed: %w", err)
 	}
 
-	// Кодируем в base64url без padding
 	encoded := base64.RawURLEncoding.EncodeToString(pack)
 	url := fmt.Sprintf("%s?dns=%s", u.url, encoded)
 
 	req, _ := http.NewRequestWithContext(context.Background(), "GET", url, nil)
 	req.Header.Set("Accept", "application/dns-message")
 
-	resp, err := client.Do(req)
+	resp, err := u.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("bad status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read body failed: %w", err)
 	}
+
+	log.Debugf("📦 DoH response: %d bytes in %v", len(body), time.Since(reqStart))
 
 	answer := new(dns.Msg)
 	if err := answer.Unpack(body); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unpack failed: %w", err)
 	}
+
 	return answer, nil
 }
 
