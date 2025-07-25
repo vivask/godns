@@ -4,8 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -36,7 +37,6 @@ type Server struct {
 }
 
 func New(cfg *config.Config) (*Server, error) {
-	log.SetLogger("server", cfg.LogLevel)
 	s := &Server{
 		cfg:     cfg,
 		cache:   NewCache(cfg.CacheSize),
@@ -177,21 +177,39 @@ func (s *Server) doHQuery(u *upstream, q *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("no client")
 	}
 
-	// DoH JSON
-	jsonURL := fmt.Sprintf("%s?name=%s&type=%d", u.url, q.Question[0].Name, q.Question[0].Qtype)
-	req, _ := http.NewRequestWithContext(context.Background(), "GET", jsonURL, nil)
-	req.Header.Set("Accept", "application/dns-json")
+	// Сериализуем запрос
+	pack, err := q.Pack()
+	if err != nil {
+		return nil, err
+	}
+
+	// Кодируем в base64url без padding
+	encoded := base64.RawURLEncoding.EncodeToString(pack)
+	url := fmt.Sprintf("%s?dns=%s", u.url, encoded)
+
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", url, nil)
+	req.Header.Set("Accept", "application/dns-message")
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	var doh dns.Msg
-	if err := json.NewDecoder(resp.Body).Decode(&doh); err != nil {
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, err
 	}
-	return &doh, nil
+
+	answer := new(dns.Msg)
+	if err := answer.Unpack(body); err != nil {
+		return nil, err
+	}
+	return answer, nil
 }
 
 func (s *Server) writeUDP(m *dns.Msg, addr *net.UDPAddr) {
