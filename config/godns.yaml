@@ -5,6 +5,13 @@ up3:          "https://dns.quad9.net/dns-query"
 cache_size:   10000     # записей
 timeout:      2s
 log_level:    debug
+vrrp:
+  enable:     yes
+  iface:      enp3s0
+  vrid:       10
+  vip:        192.168.1.9
+  prior:      200
+  adver_int:  1
 adblock:
   enable:     yes
   update:     24h

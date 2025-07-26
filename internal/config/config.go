@@ -16,6 +16,15 @@ type Config struct {
 	Timeout   time.Duration `yaml:"timeout"`
 	LogLevel  string        `yaml:"log_level"`
 
+	Vrrp struct {
+		Enable   bool   `yaml:"enable"`
+		Iface    string `yaml:"iface"`
+		Vrid     uint   `yaml:"vrid"`
+		Vip      string `yaml:"vip"`
+		Prior    uint   `yaml:"prior"`
+		AdverInt int    `yaml:"adver_int"`
+	} `yaml:"vrrp"`
+
 	Adblock struct {
 		Enable bool     `yaml:"enable"`
 		Update string   `yaml:"update"`

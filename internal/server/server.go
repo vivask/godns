@@ -14,6 +14,7 @@ import (
 
 	"godns/internal/config"
 	"godns/internal/log"
+	"godns/internal/server/vrrp"
 
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go/http3"
@@ -40,6 +41,7 @@ type Server struct {
 	upsMu   sync.Mutex
 	nextIdx int
 	adblock *Adblock
+	vrrp    *vrrp.VRRP
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -68,6 +70,14 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 		s.ups = append(s.ups, ups)
 	}
+
+	// инициализируем vrrp
+	vrrpInstance, err := vrrp.New(cfg)
+	if err != nil {
+		log.Warnf("VRRP initialization failed: %v", err)
+	}
+	s.vrrp = vrrpInstance
+
 	return s, nil
 }
 
@@ -100,6 +110,13 @@ func (u *upstream) refreshCert() error {
 }
 
 func (s *Server) Run() error {
+	// Запускаем VRRP
+	if s.vrrp != nil {
+		if err := s.vrrp.Start(); err != nil {
+			log.Warnf("VRRP start failed: %v", err)
+		}
+	}
+
 	pc, err := net.ListenPacket("udp", s.cfg.Listen)
 	if err != nil {
 		return err
@@ -319,6 +336,13 @@ func (s *Server) writeUDP(m *dns.Msg, addr net.Addr) error {
 }
 
 func (s *Server) Stop() error {
+	// Останавливаем VRRP
+	if s.vrrp != nil {
+		if err := s.vrrp.Stop(); err != nil {
+			log.Warnf("VRRP stop failed: %v", err)
+		}
+	}
+
 	close(s.closeCh)
 	_ = s.conn.Close()
 	s.wg.Wait()
