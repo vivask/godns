@@ -88,7 +88,5 @@ func (v *VRRP) GetInterfaceName() string {
 
 // isActive проверяет, активен ли VRRP (мастер или backup)
 func (v *VRRP) isActive() bool {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.master || !v.lastAdvert.IsZero()
+	return v.getState() == STATE_MASTER || v.getState() == STATE_BACKUP
 }

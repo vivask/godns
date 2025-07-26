@@ -22,33 +22,49 @@ const (
 	VRRP_PRIO_OWNER  = 255
 	VRRP_PRIO_DFL    = 100
 	VRRP_PRIO_STOP   = 0
+
+	// VRRP states
+	STATE_INIT = iota
+	STATE_BACKUP
+	STATE_MASTER
+
+	// VRRP events
+	EVENT_START
+	EVENT_SHUTDOWN
+	EVENT_GOT_ADVERT
+	EVENT_MASTER_DOWN
 )
 
-var byteOrder = binary.BigEndian
+var (
+	VRRPMultiAddrIPv4 = net.IPv4(224, 0, 0, 18)
+	VRRPMultiMAC, _   = net.ParseMAC("01:00:5e:00:00:12")
+	byteOrder         = binary.BigEndian
+)
 
 type VRRP struct {
 	cfg        *config.Config
 	iface      *net.Interface
 	conn       *packet.Conn
 	vip        net.IP
-	master     bool
+	state      int
 	priority   uint
 	vrid       uint
 	ctx        context.Context
 	cancel     context.CancelFunc
 	mu         sync.RWMutex
 	lastAdvert time.Time
+	advertInt  int // Advertisement interval in seconds
 }
 
 type VRRPHeader struct {
-	VersionType uint8    // Version (4 bits) + Type (4 bits)
-	VRID        uint8    // Virtual Router ID
-	Priority    uint8    // Router Priority
-	CountIP     uint8    // Number of IP addresses
-	AuthType    uint8    // Authentication Type
-	AdverInt    uint8    // Advertisement Interval (in seconds)
-	Checksum    uint16   // Checksum
-	IPs         []net.IP // IP addresses
+	VersionType uint8
+	VRID        uint8
+	Priority    uint8
+	CountIP     uint8
+	AuthType    uint8
+	AdverInt    uint8
+	Checksum    uint16
+	IPs         []net.IP
 }
 
 func New(cfg *config.Config) (*VRRP, error) {
@@ -67,27 +83,33 @@ func New(cfg *config.Config) (*VRRP, error) {
 	}
 
 	// Создаем packet socket для работы с VRRP пакетами
-	conn, err := packet.Listen(iface, packet.Raw, 0, nil)
+	// ETH_P_IP = 0x0800
+	conn, err := packet.Listen(iface, packet.Raw, 0x0800, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create packet socket: %w", err)
+		// Fallback - прослушивать все пакеты
+		conn, err = packet.Listen(iface, packet.Raw, 0, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create packet socket: %w", err)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	v := &VRRP{
-		cfg:      cfg,
-		iface:    iface,
-		conn:     conn,
-		vip:      vip,
-		priority: uint(cfg.Vrrp.Prior),
-		vrid:     uint(cfg.Vrrp.Vrid),
-		ctx:      ctx,
-		cancel:   cancel,
-		master:   false,
+		cfg:       cfg,
+		iface:     iface,
+		conn:      conn,
+		vip:       vip,
+		state:     STATE_INIT,
+		priority:  uint(cfg.Vrrp.Prior),
+		vrid:      uint(cfg.Vrrp.Vrid),
+		advertInt: cfg.Vrrp.AdverInt,
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
-	log.Infof("VRRP initialized: iface=%s, vrid=%d, priority=%d, vip=%s",
-		iface.Name, v.vrid, v.priority, vip.String())
+	log.Infof("VRRP initialized: iface=%s, vrid=%d, priority=%d, vip=%s, advert_int=%d",
+		iface.Name, v.vrid, v.priority, vip.String(), v.advertInt)
 
 	return v, nil
 }
@@ -97,10 +119,11 @@ func (v *VRRP) Start() error {
 		return nil
 	}
 
-	// Начинаем как backup
-	v.master = false
-	log.Infof("VRRP started on interface %s, VRID %d, priority %d",
+	log.Infof("VRRP starting on interface %s, VRID %d, priority %d",
 		v.iface.Name, v.vrid, v.priority)
+
+	// Начинаем как INIT
+	v.state = STATE_INIT
 
 	// Запуск goroutine для прослушивания VRRP пакетов
 	go v.listen()
@@ -110,6 +133,9 @@ func (v *VRRP) Start() error {
 
 	// Запуск goroutine для проверки состояния
 	go v.monitor()
+
+	// Отправляем событие START
+	v.handleEvent(EVENT_START)
 
 	return nil
 }
@@ -127,7 +153,7 @@ func (v *VRRP) Stop() error {
 	}
 
 	// Отправляем shutdown advertisement если мы мастер
-	if v.IsMaster() {
+	if v.getState() == STATE_MASTER {
 		log.Debugf("Sending shutdown advertisement")
 		v.sendAdvertisement(VRRP_PRIO_STOP)
 		v.releaseVIP()
@@ -137,10 +163,38 @@ func (v *VRRP) Stop() error {
 	return nil
 }
 
-func (v *VRRP) IsMaster() bool {
+func (v *VRRP) getState() int {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.master
+	return v.state
+}
+
+func (v *VRRP) setState(state int) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	oldState := v.state
+	v.state = state
+	log.Infof("VRRP state changed: %d -> %d", oldState, state)
+}
+
+func (v *VRRP) handleEvent(event int) {
+	switch event {
+	case EVENT_START:
+		v.setState(STATE_BACKUP)
+		log.Infof("VRRP started in BACKUP state")
+	case EVENT_SHUTDOWN:
+		if v.getState() == STATE_MASTER {
+			v.sendAdvertisement(VRRP_PRIO_STOP)
+			v.releaseVIP()
+		}
+		v.setState(STATE_INIT)
+	case EVENT_GOT_ADVERT:
+		// Обрабатывается в processAdvertisement
+	case EVENT_MASTER_DOWN:
+		if v.getState() == STATE_BACKUP {
+			v.becomeMaster()
+		}
+	}
 }
 
 func (v *VRRP) listen() {
@@ -177,34 +231,34 @@ func (v *VRRP) listen() {
 func (v *VRRP) handlePacket(data []byte) error {
 	log.Debugf("Handling incoming packet, size: %d bytes", len(data))
 
-	// Прямо парсим IP пакет, так как получаем его без Ethernet заголовка
+	// Минимальный размер IP заголовка
 	if len(data) < 20 {
 		log.Debugf("Packet too short to be IP: %d bytes", len(data))
-		return fmt.Errorf("packet too short to be IP")
+		return nil
 	}
 
 	// Проверяем версию IP (первые 4 бита)
 	version := data[0] >> 4
 	if version != 4 {
 		log.Debugf("Not an IPv4 packet, version: %d", version)
-		return fmt.Errorf("not an IPv4 packet")
+		return nil
 	}
 
 	// Проверяем протокол (должен быть VRRP)
 	protocol := data[9]
 	if protocol != VRRP_PROTO_NUM {
 		log.Debugf("Not VRRP packet, protocol: %d", protocol)
-		return nil // Не VRRP пакет, игнорируем
+		return nil
 	}
 
 	// Получаем длину заголовка IP
 	ipHeaderLen := int(data[0]&0x0F) * 4
 	log.Debugf("IP header length: %d bytes", ipHeaderLen)
 
-	// Проверяем, что у нас достаточно данных
+	// Проверяем, что у нас достаточно данных для IP заголовка
 	if len(data) < ipHeaderLen {
 		log.Debugf("Packet too short for IP header: %d < %d", len(data), ipHeaderLen)
-		return fmt.Errorf("packet too short for IP header")
+		return nil
 	}
 
 	// Извлекаем IP адреса источника и назначения
@@ -212,12 +266,18 @@ func (v *VRRP) handlePacket(data []byte) error {
 		srcIP := net.IP(data[12:16])
 		dstIP := net.IP(data[16:20])
 		log.Debugf("IP packet: src=%s, dst=%s, protocol=%d", srcIP, dstIP, protocol)
+
+		// Проверяем, что пакет отправлен на multicast адрес VRRP
+		if !dstIP.Equal(VRRPMultiAddrIPv4) {
+			log.Debugf("VRRP packet not for our multicast address: %s", dstIP)
+			return nil
+		}
 	}
 
 	// Извлекаем данные VRRP (после IP заголовка)
 	if len(data) <= ipHeaderLen {
 		log.Debugf("No VRRP data after IP header")
-		return fmt.Errorf("no VRRP data after IP header")
+		return nil
 	}
 
 	vrrpData := data[ipHeaderLen:]
@@ -227,11 +287,11 @@ func (v *VRRP) handlePacket(data []byte) error {
 	vrrpHdr, err := v.parseVRRPPacket(vrrpData)
 	if err != nil {
 		log.Debugf("Failed to parse VRRP packet: %v", err)
-		return fmt.Errorf("failed to parse VRRP packet: %w", err)
+		return nil
 	}
 
-	log.Debugf("Parsed VRRP packet: VRID=%d, Priority=%d, CountIP=%d",
-		vrrpHdr.VRID, vrrpHdr.Priority, vrrpHdr.CountIP)
+	log.Debugf("Parsed VRRP packet: VRID=%d, Priority=%d, CountIP=%d, AdverInt=%d",
+		vrrpHdr.VRID, vrrpHdr.Priority, vrrpHdr.CountIP, vrrpHdr.AdverInt)
 
 	// Проверяем VRID
 	if uint(vrrpHdr.VRID) != v.vrid {
@@ -265,8 +325,8 @@ func (v *VRRP) parseVRRPPacket(data []byte) (*VRRPHeader, error) {
 	version := hdr.VersionType >> 4
 	msgType := hdr.VersionType & 0x0F
 
-	log.Debugf("VRRP header: Version=%d, Type=%d, VRID=%d, Priority=%d, CountIP=%d",
-		version, msgType, hdr.VRID, hdr.Priority, hdr.CountIP)
+	log.Debugf("VRRP header: Version=%d, Type=%d, VRID=%d, Priority=%d, CountIP=%d, AdverInt=%d",
+		version, msgType, hdr.VRID, hdr.Priority, hdr.CountIP, hdr.AdverInt)
 
 	if version != VRRP_VERSION || msgType != VRRP_TYPE_ADVERT {
 		return nil, fmt.Errorf("unsupported VRRP version/type: %d/%d", version, msgType)
@@ -338,24 +398,24 @@ func (v *VRRP) calculateChecksum(data []byte) uint16 {
 
 func (v *VRRP) processAdvertisement(hdr *VRRPHeader) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-
+	// Сохраняем время получения advertisement
 	v.lastAdvert = time.Now()
+	v.mu.Unlock()
 
-	log.Debugf("Processing advertisement: priority=%d, current master=%t", hdr.Priority, v.master)
+	log.Debugf("Processing advertisement: priority=%d, current state=%d", hdr.Priority, v.state)
 
 	// Если приоритет 0 - другой узел выходит из строя
 	if hdr.Priority == 0 {
 		log.Infof("Received priority 0 advertisement (shutdown signal)")
-		if !v.master {
+		if v.state == STATE_BACKUP {
 			log.Infof("Other master left, attempting to become master")
 			v.becomeMaster()
 		}
 		return
 	}
 
-	// Если мы мастер и получили advertisement с более высоким приоритетом
-	if v.master {
+	// Если мы мастер и получили advertisement с более высоким или равным приоритетом
+	if v.state == STATE_MASTER {
 		log.Debugf("We are master, checking received priority %d vs our priority %d",
 			hdr.Priority, v.priority)
 
@@ -371,25 +431,38 @@ func (v *VRRP) processAdvertisement(hdr *VRRPHeader) {
 				v.becomeBackup()
 			}
 		}
-	} else {
-		// Мы backup, обновляем время последнего advertisement
+	} else if v.state == STATE_BACKUP {
+		// Мы backup, проверяем приоритет
 		log.Debugf("We are backup, received advertisement from priority %d", hdr.Priority)
+
+		if uint(hdr.Priority) > v.priority {
+			log.Debugf("Higher priority node detected, staying backup")
+			// Просто обновляем время, остаемся backup
+		} else if uint(hdr.Priority) == v.priority {
+			// При равных приоритетах сравниваем IP адреса
+			srcIP := v.getInterfaceIP()
+			if hdr.IPs[0].String() > srcIP.String() {
+				log.Debugf("Equal priority, higher IP detected, staying backup")
+				// Просто обновляем время, остаемся backup
+			} else {
+				// Наш IP больше, становимся мастером
+				log.Infof("Equal priority, our IP is higher, becoming master")
+				v.becomeMaster()
+			}
+		} else {
+			// Приоритет входящего пакета меньше нашего
+			log.Infof("Lower priority node detected (%d < %d), becoming master",
+				hdr.Priority, v.priority)
+			v.becomeMaster()
+		}
 	}
+	// Если состояние INIT, игнорируем
 }
 
 func (v *VRRP) advertise() {
 	log.Debugf("Starting advertisement routine")
 
-	if v.priority == VRRP_PRIO_OWNER {
-		// Владелец VIP всегда мастер
-		v.mu.Lock()
-		v.master = true
-		v.mu.Unlock()
-		v.announceVIP()
-		log.Infof("Owner priority, became master immediately")
-	}
-
-	ticker := time.NewTicker(time.Duration(v.cfg.Vrrp.AdverInt) * time.Second)
+	ticker := time.NewTicker(time.Duration(v.advertInt) * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -398,11 +471,7 @@ func (v *VRRP) advertise() {
 			log.Debugf("Advertisement routine stopped")
 			return
 		case <-ticker.C:
-			v.mu.RLock()
-			isMaster := v.master
-			v.mu.RUnlock()
-
-			if isMaster {
+			if v.getState() == STATE_MASTER {
 				log.Debugf("Sending advertisement with priority %d", v.priority)
 				if err := v.sendAdvertisement(uint8(v.priority)); err != nil {
 					log.Warnf("Failed to send advertisement: %v", err)
@@ -422,9 +491,9 @@ func (v *VRRP) sendAdvertisement(priority uint8) error {
 	vrrpData[0] = (VRRP_VERSION << 4) | VRRP_TYPE_ADVERT
 	vrrpData[1] = uint8(v.vrid)
 	vrrpData[2] = priority
-	vrrpData[3] = 1                          // CountIP
-	vrrpData[4] = 0                          // AuthType - none
-	vrrpData[5] = uint8(v.cfg.Vrrp.AdverInt) // AdverInt
+	vrrpData[3] = 1                  // CountIP
+	vrrpData[4] = 0                  // AuthType - none
+	vrrpData[5] = uint8(v.advertInt) // AdverInt
 
 	// IP адреса
 	copy(vrrpData[8:12], v.vip.To4())
@@ -447,7 +516,7 @@ func (v *VRRP) sendAdvertisement(priority uint8) error {
 	ipHeader[5] = 0x00
 	ipHeader[6] = 0x40                 // Flags (Don't Fragment)
 	ipHeader[7] = 0x00                 // Fragment Offset
-	ipHeader[8] = 0xFF                 // TTL
+	ipHeader[8] = 0xFF                 // TTL (должен быть 255 для VRRP)
 	ipHeader[9] = byte(VRRP_PROTO_NUM) // Protocol
 	// Checksum будет вычислен позже
 	ipHeader[10] = 0x00
@@ -457,8 +526,8 @@ func (v *VRRP) sendAdvertisement(priority uint8) error {
 	copy(ipHeader[12:16], srcIP.To4())
 	log.Debugf("Source IP: %s", srcIP.String())
 	// Dst IP - VRRP multicast 224.0.0.18
-	copy(ipHeader[16:20], net.ParseIP("224.0.0.18").To4())
-	log.Debugf("Destination IP: 224.0.0.18")
+	copy(ipHeader[16:20], VRRPMultiAddrIPv4.To4())
+	log.Debugf("Destination IP: %s", VRRPMultiAddrIPv4.String())
 
 	// Вычисляем IP checksum
 	ipChecksum := v.calculateIPChecksum(ipHeader[:20])
@@ -474,10 +543,10 @@ func (v *VRRP) sendAdvertisement(priority uint8) error {
 
 	// Отправляем пакет
 	dstAddr := &packet.Addr{
-		HardwareAddr: net.HardwareAddr{0x01, 0x00, 0x5e, 0x00, 0x00, 0x12}, // VRRP multicast MAC
+		HardwareAddr: VRRPMultiMAC, // VRRP multicast MAC
 	}
 
-	log.Debugf("Sending VRRP packet to multicast MAC")
+	log.Debugf("Sending VRRP packet to multicast MAC: %s", VRRPMultiMAC.String())
 	_, err := v.conn.WriteTo(packetData, dstAddr)
 	if err != nil {
 		log.Warnf("Failed to send VRRP packet: %v", err)
@@ -534,7 +603,9 @@ func (v *VRRP) getInterfaceIP() net.IP {
 func (v *VRRP) monitor() {
 	log.Debugf("Starting VRRP monitor")
 
-	ticker := time.NewTicker(3 * time.Duration(v.cfg.Vrrp.AdverInt) * time.Second)
+	// Таймер мастер-даун = 3 * advert_int
+	masterDownInterval := 3 * time.Duration(v.advertInt) * time.Second
+	ticker := time.NewTicker(time.Second) // Проверяем каждую секунду
 	defer ticker.Stop()
 
 	for {
@@ -543,36 +614,44 @@ func (v *VRRP) monitor() {
 			log.Debugf("Monitor stopped")
 			return
 		case <-ticker.C:
-			v.mu.Lock()
-			if v.master {
+			if v.getState() == STATE_MASTER {
 				log.Debugf("Monitor: we are master, no action needed")
 				// Мы мастер, ничего не делаем
-			} else {
-				// Если давно не было advertisement, становимся мастером
-				if time.Since(v.lastAdvert) > 3*time.Duration(v.cfg.Vrrp.AdverInt)*time.Second {
-					log.Infof("No advertisements received for %v, becoming master",
-						time.Since(v.lastAdvert))
-					v.becomeMaster()
+			} else if v.getState() == STATE_BACKUP {
+				// Проверяем, не истекло ли время с последнего advertisement
+				v.mu.RLock()
+				lastAdvert := v.lastAdvert
+				v.mu.RUnlock()
+
+				// Если это первый запуск и lastAdvert нулевой, пропускаем
+				if lastAdvert.IsZero() {
+					log.Debugf("Monitor: backup state, no advertisements yet")
+					continue
+				}
+
+				if time.Since(lastAdvert) > masterDownInterval {
+					log.Infof("Master down detected (no advertisements for %v), becoming master",
+						time.Since(lastAdvert))
+					v.handleEvent(EVENT_MASTER_DOWN)
 				} else {
 					log.Debugf("Monitor: backup state, last advert %v ago",
-						time.Since(v.lastAdvert))
+						time.Since(lastAdvert))
 				}
 			}
-			v.mu.Unlock()
 		}
 	}
 }
 
 func (v *VRRP) becomeMaster() {
 	log.Infof("Becoming VRRP master")
-	v.master = true
+	v.setState(STATE_MASTER)
 	v.announceVIP()
 	log.Infof("Became VRRP master")
 }
 
 func (v *VRRP) becomeBackup() {
 	log.Infof("Becoming VRRP backup")
-	v.master = false
+	v.setState(STATE_BACKUP)
 	v.releaseVIP()
 	log.Infof("Became VRRP backup")
 }
