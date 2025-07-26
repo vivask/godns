@@ -10,6 +10,8 @@ adblock:
   update:     24h
   time:       03:00:00
   sources:
+    - https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/domains/pro.plus.txt
+    - https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/domains/tif.txt
     - https://someonewhocares.org/hosts/zero/hosts
     - https://adaway.org/hosts.txt
     - https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext
