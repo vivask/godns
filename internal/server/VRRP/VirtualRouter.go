@@ -115,7 +115,6 @@ func (r *VirtualRouter) setMasterAdvInterval(Interval uint16) *VirtualRouter {
 	r.advertisementIntervalOfMaster = Interval
 	r.skewTime = r.advertisementIntervalOfMaster - uint16(float32(r.advertisementIntervalOfMaster)*float32(r.priority)/256)
 	r.masterDownInterval = 3*r.advertisementIntervalOfMaster + r.skewTime
-	//从MasterDownInterval和SkewTime的计算方式来看，同一组VirtualRouter中，Priority越高的Router越快地认为某个Master失效
 	return r
 }
 

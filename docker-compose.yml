@@ -9,7 +9,7 @@ services:
     ports:
       - "53:53/udp"
     volumes:
-      - ./config/godns.yaml:/etc/godns.yaml:ro
+#      - ./config/godns.yaml:/etc/godns.yaml:ro
       - /etc/godns:/etc/godns
       - /var/log/godns:/var/log/godns
       - /etc/godns:/etc/godns
