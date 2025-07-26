@@ -96,13 +96,13 @@ func New(cfg *config.Config) (*Server, error) {
 		// s.vr.SetAdvInterval(time.Duration(cfg.Vrrp.AdverInt) * time.Second) // Устанавливается через SetPriorityAndMasterAdvInterval
 
 		// Добавляем VIP в список защищаемых адресов
-		if vip := net.ParseIP(cfg.Vrrp.Vip); vip != nil {
-			s.vr.AddIPvXAddr(vip)
-			log.Infof("VIP %s added to VRRP", cfg.Vrrp.Vip)
-		} else {
+		vip, _, err := net.ParseCIDR(fmt.Sprintf("%s/24", cfg.Vrrp.Vip))
+		if err != nil {
 			log.Errorf("Failed to parse VIP address: %s", cfg.Vrrp.Vip)
 			return nil, fmt.Errorf("failed to parse VIP address: %s", cfg.Vrrp.Vip)
 		}
+		s.vr.AddIPvXAddr(vip)
+		log.Infof("VIP %s added to VRRP", cfg.Vrrp.Vip)
 
 		// (Опционально) Регистрируем обработчики переходов состояний
 		s.vr.Enroll(VRRP.Master2Backup, func() { log.Info("init to MASTER") })
