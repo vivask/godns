@@ -2,6 +2,7 @@
 package vrrp
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -82,15 +83,11 @@ func New(cfg *config.Config) (*VRRP, error) {
 		return nil, fmt.Errorf("invalid VIP address: %s", cfg.Vrrp.Vip)
 	}
 
-	// Создаем packet socket для работы с VRRP пакетами
-	// ETH_P_IP = 0x0800
-	conn, err := packet.Listen(iface, packet.Raw, 0x0800, nil)
+	// Создаем packet socket для работы с Ethernet фреймами
+	// ETH_P_ALL = 0x0003 для получения всех пакетов
+	conn, err := packet.Listen(iface, packet.Raw, 0x0003, nil)
 	if err != nil {
-		// Fallback - прослушивать все пакеты
-		conn, err = packet.Listen(iface, packet.Raw, 0, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create packet socket: %w", err)
-		}
+		return nil, fmt.Errorf("failed to create packet socket: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -188,12 +185,6 @@ func (v *VRRP) handleEvent(event int) {
 			v.releaseVIP()
 		}
 		v.setState(STATE_INIT)
-	case EVENT_GOT_ADVERT:
-		// Обрабатывается в processAdvertisement
-	case EVENT_MASTER_DOWN:
-		if v.getState() == STATE_BACKUP {
-			v.becomeMaster()
-		}
 	}
 }
 
@@ -231,56 +222,85 @@ func (v *VRRP) listen() {
 func (v *VRRP) handlePacket(data []byte) error {
 	log.Debugf("Handling incoming packet, size: %d bytes", len(data))
 
-	// Минимальный размер IP заголовка
-	if len(data) < 20 {
-		log.Debugf("Packet too short to be IP: %d bytes", len(data))
+	// Минимальный размер Ethernet фрейма
+	if len(data) < 14 {
+		log.Debugf("Packet too short to be Ethernet frame: %d bytes", len(data))
+		return nil
+	}
+
+	// Парсим Ethernet фрейм
+	dstMAC := net.HardwareAddr(data[0:6])
+	srcMAC := net.HardwareAddr(data[6:12])
+	ethType := binary.BigEndian.Uint16(data[12:14])
+
+	log.Debugf("Ethernet frame: dst=%s, src=%s, type=0x%04x", dstMAC, srcMAC, ethType)
+
+	// Проверяем тип Ethernet (должен быть IPv4)
+	if ethType != 0x0800 {
+		log.Debugf("Not an IPv4 Ethernet frame, type: 0x%04x", ethType)
+		return nil
+	}
+
+	// Проверяем, что пакет отправлен на наш multicast адрес или broadcast
+	if !bytes.Equal(dstMAC, VRRPMultiMAC) && !bytes.Equal(dstMAC, net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) {
+		// Проверяем, может быть это unicast на наш MAC?
+		if !bytes.Equal(dstMAC, v.iface.HardwareAddr) {
+			log.Debugf("Not for our MAC: %s", dstMAC)
+			return nil
+		}
+	}
+
+	// Извлекаем IP данные (после Ethernet заголовка)
+	ipData := data[14:]
+	if len(ipData) < 20 {
+		log.Debugf("IP data too short: %d bytes", len(ipData))
 		return nil
 	}
 
 	// Проверяем версию IP (первые 4 бита)
-	version := data[0] >> 4
+	version := ipData[0] >> 4
 	if version != 4 {
 		log.Debugf("Not an IPv4 packet, version: %d", version)
 		return nil
 	}
 
 	// Проверяем протокол (должен быть VRRP)
-	protocol := data[9]
+	protocol := ipData[9]
 	if protocol != VRRP_PROTO_NUM {
 		log.Debugf("Not VRRP packet, protocol: %d", protocol)
 		return nil
 	}
 
 	// Получаем длину заголовка IP
-	ipHeaderLen := int(data[0]&0x0F) * 4
+	ipHeaderLen := int(ipData[0]&0x0F) * 4
 	log.Debugf("IP header length: %d bytes", ipHeaderLen)
 
 	// Проверяем, что у нас достаточно данных для IP заголовка
-	if len(data) < ipHeaderLen {
-		log.Debugf("Packet too short for IP header: %d < %d", len(data), ipHeaderLen)
+	if len(ipData) < ipHeaderLen {
+		log.Debugf("IP data too short for IP header: %d < %d", len(ipData), ipHeaderLen)
 		return nil
 	}
 
 	// Извлекаем IP адреса источника и назначения
-	if len(data) >= 20 {
-		srcIP := net.IP(data[12:16])
-		dstIP := net.IP(data[16:20])
+	if len(ipData) >= 20 {
+		srcIP := net.IP(ipData[12:16])
+		dstIP := net.IP(ipData[16:20])
 		log.Debugf("IP packet: src=%s, dst=%s, protocol=%d", srcIP, dstIP, protocol)
 
-		// Проверяем, что пакет отправлен на multicast адрес VRRP
-		if !dstIP.Equal(VRRPMultiAddrIPv4) {
-			log.Debugf("VRRP packet not for our multicast address: %s", dstIP)
+		// Проверяем, что пакет отправлен на multicast адрес VRRP или на наш VIP
+		if !dstIP.Equal(VRRPMultiAddrIPv4) && !dstIP.Equal(v.vip) {
+			log.Debugf("VRRP packet not for our address: %s", dstIP)
 			return nil
 		}
 	}
 
 	// Извлекаем данные VRRP (после IP заголовка)
-	if len(data) <= ipHeaderLen {
+	if len(ipData) <= ipHeaderLen {
 		log.Debugf("No VRRP data after IP header")
 		return nil
 	}
 
-	vrrpData := data[ipHeaderLen:]
+	vrrpData := ipData[ipHeaderLen:]
 	log.Debugf("VRRP data size: %d bytes", len(vrrpData))
 
 	// Парсим VRRP пакет
@@ -535,11 +555,19 @@ func (v *VRRP) sendAdvertisement(priority uint8) error {
 	ipHeader[11] = byte(ipChecksum & 0xFF)
 	log.Debugf("IP checksum: 0x%02x%02x", ipHeader[10], ipHeader[11])
 
-	// Собираем полный пакет
-	packetData := make([]byte, len(ipHeader)+len(vrrpData))
-	copy(packetData, ipHeader)
-	copy(packetData[20:], vrrpData)
-	log.Debugf("Full packet size: %d bytes", len(packetData))
+	// Создаем Ethernet фрейм
+	ethFrame := make([]byte, 14+len(ipHeader)+len(vrrpData))
+
+	// Ethernet заголовок
+	copy(ethFrame[0:6], VRRPMultiMAC)                   // Destination MAC
+	copy(ethFrame[6:12], v.iface.HardwareAddr)          // Source MAC
+	binary.BigEndian.PutUint16(ethFrame[12:14], 0x0800) // EtherType = IPv4
+
+	// IP пакет
+	copy(ethFrame[14:14+20], ipHeader)
+	copy(ethFrame[14+20:], vrrpData)
+
+	log.Debugf("Full Ethernet frame size: %d bytes", len(ethFrame))
 
 	// Отправляем пакет
 	dstAddr := &packet.Addr{
@@ -547,7 +575,7 @@ func (v *VRRP) sendAdvertisement(priority uint8) error {
 	}
 
 	log.Debugf("Sending VRRP packet to multicast MAC: %s", VRRPMultiMAC.String())
-	_, err := v.conn.WriteTo(packetData, dstAddr)
+	_, err := v.conn.WriteTo(ethFrame, dstAddr)
 	if err != nil {
 		log.Warnf("Failed to send VRRP packet: %v", err)
 		return fmt.Errorf("failed to send VRRP packet: %w", err)
@@ -632,7 +660,7 @@ func (v *VRRP) monitor() {
 				if time.Since(lastAdvert) > masterDownInterval {
 					log.Infof("Master down detected (no advertisements for %v), becoming master",
 						time.Since(lastAdvert))
-					v.handleEvent(EVENT_MASTER_DOWN)
+					v.becomeMaster()
 				} else {
 					log.Debugf("Monitor: backup state, last advert %v ago",
 						time.Since(lastAdvert))
