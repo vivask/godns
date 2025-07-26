@@ -259,7 +259,7 @@ func (v *VRRP) handlePacket(data []byte) error {
 	if protocol != VRRP_PROTO_NUM {
 		// Это нормально, не все пакеты должны быть VRRP
 		// log.Debugf("Not VRRP packet, protocol: %d", protocol) // Убираем это сообщение для уменьшения шума
-		return nil
+		// return nil
 	}
 
 	// Получаем длину заголовка IP
