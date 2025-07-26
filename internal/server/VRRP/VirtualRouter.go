@@ -81,7 +81,7 @@ func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) *VirtualRout
 		//set up IPv6 interface
 		vr.iplayerInterface = NewIPv6Con(vr.preferredSourceIP, VRRPMultiAddrIPv6)
 	}
-	log.Infof("virtual router %v initialized, working on %v", VRID, nif)
+	log.Infof("virtual router %v initialized, working on %v, priority: %d", VRID, nif, vr.priority)
 	return vr
 
 }
