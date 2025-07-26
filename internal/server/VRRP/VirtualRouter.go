@@ -191,7 +191,7 @@ func (r *VirtualRouter) fetchVRRPPacket() {
 			}
 
 		}
-		log.Debug("VirtualRouter.fetchVRRPPacket: received one advertisement")
+		// log.Debug("VirtualRouter.fetchVRRPPacket: received one advertisement")
 	}
 }
 
