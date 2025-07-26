@@ -6,7 +6,7 @@ cache_size:   10000     # записей
 timeout:      2s
 log_level:    debug
 vrrp:
-  enable:     yes
+  enable:     no
   iface:      enp3s0
   vrid:       10
   vip:        192.168.1.9
