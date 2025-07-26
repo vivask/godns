@@ -144,9 +144,9 @@ func (r *VirtualRouter) RemoveIPvXAddr(ip net.IP) {
 }
 
 func (r *VirtualRouter) sendAdvertMessage() {
-	for k := range r.protectedIPaddrs {
-		log.Debugf("send advert message of IP %v", net.IP(k[:]))
-	}
+	// for k := range r.protectedIPaddrs {
+	// 	log.Debugf("send advert message of IP %v", net.IP(k[:]))
+	// }
 	var x = r.assembleVRRPPacket()
 	if errOfWrite := r.iplayerInterface.WriteMessage(x); errOfWrite != nil {
 		log.Errorf("VirtualRouter.WriteMessage: %v", errOfWrite)
