@@ -255,11 +255,11 @@ func (v *VRRP) handlePacket(data []byte) error {
 	}
 
 	// Проверяем протокол (должен быть VRRP)
-	protocol := ipData[9]
-	if protocol != VRRP_PROTO_NUM {
-		log.Debugf("Not VRRP packet, protocol: %d", protocol)
-		return nil // Это нормально, не все пакеты должны быть VRRP
-	}
+	// protocol := ipData[9]
+	// if protocol != VRRP_PROTO_NUM {
+	// 	log.Debugf("Not VRRP packet, protocol: %d", protocol)
+	// 	return nil // Это нормально, не все пакеты должны быть VRRP
+	// }
 
 	// Получаем длину заголовка IP
 	ipHeaderLen := int(ipData[0]&0x0F) * 4
