@@ -4,7 +4,7 @@ up2:          "https://dns.google/dns-query"
 up3:          "https://dns.quad9.net/dns-query"
 cache_size:   10000     # записей
 timeout:      2s
-log_level:    info
+log_level:    debug
 vrrp:
   enable:     yes
   iface:      enp3s0
