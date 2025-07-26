@@ -110,8 +110,6 @@ func New(cfg *config.Config) (*Server, error) {
 		s.vr.Enroll(VRRP.Init2Master, func() { log.Info("init to BACKUP") })
 		s.vr.Enroll(VRRP.Init2Backup, func() { log.Info("master to BACKUP") })
 
-		s.vr.SetPreemptMode(true)
-
 		log.Infof("VRRP initialized for VRID %d, priority %d on interface %s", cfg.Vrrp.Vrid, cfg.Vrrp.Prior, cfg.Vrrp.Iface)
 	}
 
