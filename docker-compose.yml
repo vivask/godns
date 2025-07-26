@@ -10,9 +10,9 @@ services:
       - "53:53/udp"
     volumes:
       - ./config/godns.yaml:/etc/godns.yaml:ro
+      - /etc/godns:/etc/godns
       - /var/log/godns:/var/log/godns
       - /etc/godns:/etc/godns
-      - ad-data:/var/lib/godns
     cap_add:
       - NET_BIND_SERVICE
     restart: unless-stopped
@@ -21,6 +21,3 @@ services:
     dns:
       - 1.1.1.1
       - 8.8.8.8
-volumes:
-  ad-data:
-    driver: local
