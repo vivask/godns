@@ -10,7 +10,7 @@ vrrp:
   iface:      enp3s0
   vrid:       10
   vip:        192.168.1.9
-  prior:      200
+  prior:      255
   adver_int:  1
 adblock:
   enable:     yes
