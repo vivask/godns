@@ -255,11 +255,12 @@ func (v *VRRP) handlePacket(data []byte) error {
 	}
 
 	// Проверяем протокол (должен быть VRRP)
-	// protocol := ipData[9]
-	// if protocol != VRRP_PROTO_NUM {
-	// 	log.Debugf("Not VRRP packet, protocol: %d", protocol)
-	// 	return nil // Это нормально, не все пакеты должны быть VRRP
-	// }
+	protocol := ipData[9]
+	if protocol != VRRP_PROTO_NUM {
+		// Это нормально, не все пакеты должны быть VRRP
+		// log.Debugf("Not VRRP packet, protocol: %d", protocol) // Убираем это сообщение для уменьшения шума
+		return nil
+	}
 
 	// Получаем длину заголовка IP
 	ipHeaderLen := int(ipData[0]&0x0F) * 4
@@ -273,13 +274,20 @@ func (v *VRRP) handlePacket(data []byte) error {
 
 	// Извлекаем IP адреса источника и назначения
 	if len(ipData) >= 20 {
+		srcIP := net.IP(ipData[12:16])
 		dstIP := net.IP(ipData[16:20])
-		// Пакет должен быть отправлен на VRRP multicast адрес
-		if !dstIP.Equal(VRRPMultiAddrIPv4) { // 224.0.0.18
-			log.Debugf("VRRP packet not for our multicast address: %s", dstIP)
+		log.Debugf("VRRP IP packet: src=%s, dst=%s, protocol=%d", srcIP, dstIP, protocol)
+
+		// Пакет должен быть отправлен либо:
+		// 1. На VRRP multicast адрес 224.0.0.18
+		// 2. На IP адрес нашего интерфейса (unicast)
+		ourIP := v.getInterfaceIP()
+		if !dstIP.Equal(VRRPMultiAddrIPv4) && !dstIP.Equal(ourIP) {
+			log.Debugf("VRRP packet not for our address: dst=%s, multicast=%s, our_ip=%s",
+				dstIP, VRRPMultiAddrIPv4, ourIP)
 			return nil
 		}
-		log.Debugf("VRRP packet for our multicast address: %s", dstIP)
+		log.Debugf("VRRP packet for our address: dst=%s", dstIP)
 	}
 
 	// Извлекаем данные VRRP (после IP заголовка)
