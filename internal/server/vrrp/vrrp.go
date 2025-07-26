@@ -2,7 +2,6 @@
 package vrrp
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -241,15 +240,6 @@ func (v *VRRP) handlePacket(data []byte) error {
 		return nil
 	}
 
-	// Проверяем, что пакет отправлен на наш multicast адрес или broadcast
-	if !bytes.Equal(dstMAC, VRRPMultiMAC) && !bytes.Equal(dstMAC, net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) {
-		// Проверяем, может быть это unicast на наш MAC?
-		if !bytes.Equal(dstMAC, v.iface.HardwareAddr) {
-			log.Debugf("Not for our MAC: %s", dstMAC)
-			return nil
-		}
-	}
-
 	// Извлекаем IP данные (после Ethernet заголовка)
 	ipData := data[14:]
 	if len(ipData) < 20 {
@@ -268,7 +258,7 @@ func (v *VRRP) handlePacket(data []byte) error {
 	protocol := ipData[9]
 	if protocol != VRRP_PROTO_NUM {
 		log.Debugf("Not VRRP packet, protocol: %d", protocol)
-		return nil
+		return nil // Это нормально, не все пакеты должны быть VRRP
 	}
 
 	// Получаем длину заголовка IP
@@ -283,15 +273,13 @@ func (v *VRRP) handlePacket(data []byte) error {
 
 	// Извлекаем IP адреса источника и назначения
 	if len(ipData) >= 20 {
-		srcIP := net.IP(ipData[12:16])
 		dstIP := net.IP(ipData[16:20])
-		log.Debugf("IP packet: src=%s, dst=%s, protocol=%d", srcIP, dstIP, protocol)
-
-		// Проверяем, что пакет отправлен на multicast адрес VRRP или на наш VIP
-		if !dstIP.Equal(VRRPMultiAddrIPv4) && !dstIP.Equal(v.vip) {
-			log.Debugf("VRRP packet not for our address: %s", dstIP)
+		// Пакет должен быть отправлен на VRRP multicast адрес
+		if !dstIP.Equal(VRRPMultiAddrIPv4) { // 224.0.0.18
+			log.Debugf("VRRP packet not for our multicast address: %s", dstIP)
 			return nil
 		}
+		log.Debugf("VRRP packet for our multicast address: %s", dstIP)
 	}
 
 	// Извлекаем данные VRRP (после IP заголовка)
