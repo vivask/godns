@@ -76,7 +76,7 @@ func New(cfg *config.Config) (*VRRP, error) {
 
 	v := &VRRP{
 		cfg:      cfg,
-		ifface:   iface,
+		iface:    iface,
 		conn:     conn,
 		vip:      vip,
 		priority: uint(cfg.Vrrp.Prior),

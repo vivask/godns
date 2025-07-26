@@ -6,7 +6,6 @@ go 1.24.5
 // Copyright (C)
 
 require (
-	github.com/google/gopacket v1.1.19
 	github.com/mdlayher/packet v1.0.0
 	github.com/miekg/dns v1.1.67
 	github.com/op/go-logging v0.0.0-20160315200505-970db520ece7
