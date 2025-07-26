@@ -9,12 +9,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync"
 	"time"
 
 	"godns/internal/config"
 	"godns/internal/log"
-	"godns/internal/server/vrrp"
+	"godns/internal/server/VRRP"
 
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go/http3"
@@ -41,7 +42,7 @@ type Server struct {
 	upsMu   sync.Mutex
 	nextIdx int
 	adblock *Adblock
-	vrrp    *vrrp.VRRP
+	vr      *VRRP.VirtualRouter
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -50,6 +51,7 @@ func New(cfg *config.Config) (*Server, error) {
 		cache:   NewCache(cfg.CacheSize),
 		closeCh: make(chan struct{}),
 		zone:    NewZone(""),
+		vr:      nil,
 	}
 
 	if cfg.Adblock.Enable {
@@ -71,12 +73,45 @@ func New(cfg *config.Config) (*Server, error) {
 		s.ups = append(s.ups, ups)
 	}
 
-	// инициализируем vrrp
-	vrrpInstance, err := vrrp.New(cfg)
-	if err != nil {
-		log.Warnf("VRRP initialization failed: %v", err)
+	// инициализируем VRRP
+	if cfg.Vrrp.Enable {
+		log.Infof("Initializing VRRP...")
+		// Определяем версию IP
+		ipVersion := VRRP.IPv4
+		if vip, err := netip.ParseAddr(cfg.Vrrp.Vip); err == nil && vip.Is6() {
+			ipVersion = VRRP.IPv6
+		} else if err != nil {
+			log.Errorf("Invalid VIP address format: %s", cfg.Vrrp.Vip)
+			return nil, fmt.Errorf("invalid VIP address: %w", err)
+		}
+
+		// Создаем VirtualRouter
+		// Предполагаем, что Owner = (cfg.Vrrp.Prior == 255) согласно RFC
+		isOwner := cfg.Vrrp.Prior == 255
+		s.vr = VRRP.NewVirtualRouter(byte(cfg.Vrrp.Vrid), cfg.Vrrp.Iface, isOwner, byte(ipVersion))
+
+		// Устанавливаем параметры
+		s.vr.SetPriorityAndMasterAdvInterval(byte(cfg.Vrrp.Prior), time.Duration(cfg.Vrrp.AdverInt)*time.Second)
+		// s.vr.SetPreemptMode(true) // Можно установить, если нужно
+		// s.vr.SetAdvInterval(time.Duration(cfg.Vrrp.AdverInt) * time.Second) // Устанавливается через SetPriorityAndMasterAdvInterval
+
+		// Добавляем VIP в список защищаемых адресов
+		if vip := net.ParseIP(cfg.Vrrp.Vip); vip != nil {
+			s.vr.AddIPvXAddr(vip)
+			log.Infof("VIP %s added to VRRP", cfg.Vrrp.Vip)
+		} else {
+			log.Errorf("Failed to parse VIP address: %s", cfg.Vrrp.Vip)
+			return nil, fmt.Errorf("failed to parse VIP address: %s", cfg.Vrrp.Vip)
+		}
+
+		// (Опционально) Регистрируем обработчики переходов состояний
+		// s.vr.Enroll(vrrp.Master2Backup, func() { /* обработка перехода в BACKUP */ })
+		// s.vr.Enroll(vrrp.Backup2Master, func() { /* обработка перехода в MASTER */ })
+		// s.vr.Enroll(vrrp.Init2Master, func() { /* обработка перехода в MASTER из INIT */ })
+		// s.vr.Enroll(vrrp.Init2Backup, func() { /* обработка перехода в BACKUP из INIT */ })
+
+		log.Infof("VRRP initialized for VRID %d on interface %s", cfg.Vrrp.Vrid, cfg.Vrrp.Iface)
 	}
-	s.vrrp = vrrpInstance
 
 	return s, nil
 }
@@ -111,10 +146,18 @@ func (u *upstream) refreshCert() error {
 
 func (s *Server) Run() error {
 	// Запускаем VRRP
-	if s.vrrp != nil {
-		if err := s.vrrp.Start(); err != nil {
-			log.Warnf("VRRP start failed: %v", err)
-		}
+	if s.vr != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			log.Infof("Starting VRRP...")
+			// Выбираем метод запуска: StartWithEventLoop или StartWithEventSelector
+			// eventSelector кажется более надежным, так как использует select во всех состояниях
+			s.vr.StartWithEventSelector()
+			// s.vr.StartWithEventLoop() // Альтернатива
+			log.Infof("VRRP goroutine finished")
+		}()
+		log.Infof("VRRP started in a goroutine")
 	}
 
 	pc, err := net.ListenPacket("udp", s.cfg.Listen)
@@ -337,10 +380,14 @@ func (s *Server) writeUDP(m *dns.Msg, addr net.Addr) error {
 
 func (s *Server) Stop() error {
 	// Останавливаем VRRP
-	if s.vrrp != nil {
-		if err := s.vrrp.Stop(); err != nil {
-			log.Warnf("VRRP stop failed: %v", err)
-		}
+	if s.vr != nil {
+		log.Infof("Stopping VRRP...")
+		s.vr.Stop() // Отправляет SHUTDOWN в eventChannel
+		// Ждем завершения VRRP? Текущая реализация VRRP не предоставляет явного WaitGroup.
+		// Предполагается, что после отправки SHUTDOWN, VRRP завершится.
+		// Возможно, потребуется добавить WaitGroup в VirtualRouter или использовать таймаут.
+		// time.Sleep(1 * time.Second) // Простое ожидание, не идеально
+		log.Infof("VRRP stop signal sent")
 	}
 
 	close(s.closeCh)
