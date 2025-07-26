@@ -17,10 +17,11 @@ type Config struct {
 	LogLevel  string        `yaml:"log_level"`
 
 	Adblock struct {
-		Enable  bool     `yaml:"enable"`
-		Update  string   `yaml:"update"`
-		Time    string   `yaml:"time"`
-		Sources []string `yaml:"sources"`
+		Enable bool     `yaml:"enable"`
+		Update string   `yaml:"update"`
+		Time   string   `yaml:"time"`
+		Black  []string `yaml:"black"`
+		White  []string `yaml:"white"`
 	} `yaml:"adblock"`
 }
 

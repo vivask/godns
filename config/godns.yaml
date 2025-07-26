@@ -9,19 +9,10 @@ adblock:
   enable:     yes
   update:     24h
   time:       03:00:00
-  sources:
+  black:
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/domains/pro.plus.txt
-    - https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/domains/tif.txt
-    - https://someonewhocares.org/hosts/zero/hosts
-    - https://adaway.org/hosts.txt
-    - https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext
-    - https://cdn.jsdelivr.net/gh/evankrob/hosts-filenetrehost@master/ad_servers.txt
-    - https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
-    - https://filters.adtidy.org/extension/chromium/filters/2.txt
-    - https://filters.adtidy.org/extension/chromium/filters/3.txt
-    - https://easylist.to/easylist/easylist.txt
-    - https://easylist.to/easylist/fanboy-annoyance.txt
-    - https://easylist-downloads.adblockplus.org/advblock+cssfixes.txt
-    - https://easylist-downloads.adblockplus.org/cntblock.txt
     - https://raw.githubusercontent.com/hoshsadiq/adblock-nocoin-list/master/hosts.txt
     - https://phishing.army/download/phishing_army_blocklist.txt
+  white:
+    - metrics.icloud.com
+    - safebrowsing.googleapis.com
