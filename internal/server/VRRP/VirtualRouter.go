@@ -189,9 +189,7 @@ func (r *VirtualRouter) fetchVRRPPacket() {
 			} else {
 				log.Errorf("VirtualRouter.fetchVRRPPacket: received a advertisement with different ID: %v", packet.GetVirtualRouterID())
 			}
-
 		}
-		// log.Debug("VirtualRouter.fetchVRRPPacket: received one advertisement")
 	}
 }
 
