@@ -3,6 +3,7 @@ package vrrp
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
@@ -11,8 +12,6 @@ import (
 	"godns/internal/config"
 	"godns/internal/log"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 	"github.com/mdlayher/packet"
 )
 
@@ -24,6 +23,8 @@ const (
 	VRRP_PRIO_DFL    = 100
 	VRRP_PRIO_STOP   = 0
 )
+
+var byteOrder = binary.BigEndian
 
 type VRRP struct {
 	cfg        *config.Config
@@ -66,7 +67,7 @@ func New(cfg *config.Config) (*VRRP, error) {
 	}
 
 	// Создаем packet socket для работы с VRRP пакетами
-	conn, err := packet.Listen(iface, packet.Raw, int(layers.EthernetTypeIPv4), nil)
+	conn, err := packet.Listen(iface, packet.Raw, 0, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create packet socket: %w", err)
 	}
@@ -163,40 +164,36 @@ func (v *VRRP) listen() {
 }
 
 func (v *VRRP) handlePacket(data []byte) error {
-	// Парсим Ethernet фрейм
-	ethLayer := &layers.Ethernet{}
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, ethLayer)
-	decoded := []gopacket.LayerType{}
-
-	if err := parser.DecodeLayers(data, &decoded); err != nil {
-		return fmt.Errorf("failed to decode ethernet frame: %w", err)
+	// Прямо парсим IP пакет, так как получаем его без Ethernet заголовка
+	if len(data) < 20 {
+		return fmt.Errorf("packet too short to be IP")
 	}
 
-	// Проверяем, что это IP пакет
-	if ethLayer.EthernetType != layers.EthernetTypeIPv4 {
-		return nil
+	// Проверяем версию IP (первые 4 бита)
+	version := data[0] >> 4
+	if version != 4 {
+		return fmt.Errorf("not an IPv4 packet")
 	}
 
-	// Находим IP слой
-	var ipLayer *layers.IPv4
-	for _, layerType := range decoded {
-		if layerType == layers.LayerTypeIPv4 {
-			ipLayer = &layers.IPv4{}
-			break
-		}
+	// Проверяем протокол (должен быть VRRP)
+	protocol := data[9]
+	if protocol != VRRP_PROTO_NUM {
+		return nil // Не VRRP пакет, игнорируем
 	}
 
-	if ipLayer == nil {
-		return nil
+	// Получаем длину заголовка IP
+	ipHeaderLen := int(data[0]&0x0F) * 4
+
+	// Проверяем, что у нас достаточно данных
+	if len(data) < ipHeaderLen {
+		return fmt.Errorf("packet too short for IP header")
 	}
 
-	// Проверяем, что это VRRP протокол
-	if ipLayer.Protocol != VRRP_PROTO_NUM {
-		return nil
-	}
+	// Извлекаем данные VRRP (после IP заголовка)
+	vrrpData := data[ipHeaderLen:]
 
 	// Парсим VRRP пакет
-	vrrpHdr, err := v.parseVRRPPacket(ipLayer.Payload)
+	vrrpHdr, err := v.parseVRRPPacket(vrrpData)
 	if err != nil {
 		return fmt.Errorf("failed to parse VRRP packet: %w", err)
 	}
@@ -308,7 +305,7 @@ func (v *VRRP) processAdvertisement(hdr *VRRPHeader) {
 	// Если мы мастер и получили advertisement с более высоким приоритетом
 	if v.master {
 		if uint(hdr.Priority) > v.priority ||
-			(uint(hdr.Priority) == v.priority && hdr.IPs[0].String() > v.vip.String()) {
+			(uint(hdr.Priority) == v.priority && len(hdr.IPs) > 0 && hdr.IPs[0].String() > v.vip.String()) {
 			log.Infof("Higher priority node detected, becoming backup")
 			v.becomeBackup()
 		}
@@ -363,50 +360,70 @@ func (v *VRRP) sendAdvertisement(priority uint8) error {
 	vrrpData[6] = byte(checksum >> 8)
 	vrrpData[7] = byte(checksum & 0xFF)
 
-	// Создаем IP пакет
-	ipHdr := &layers.IPv4{
-		Version:    4,
-		IHL:        5,
-		TOS:        0,
-		Length:     20 + uint16(len(vrrpData)),
-		Id:         0,
-		Flags:      layers.IPv4DontFragment,
-		FragOffset: 0,
-		TTL:        255,
-		Protocol:   VRRP_PROTO_NUM,
-		SrcIP:      v.getInterfaceIP(),        // Получаем IP интерфейса
-		DstIP:      net.ParseIP("224.0.0.18"), // VRRP multicast адрес
-	}
+	// Создаем минимальный IP заголовок
+	ipHeader := make([]byte, 20)
+	ipHeader[0] = 0x45 // Version 4, IHL 5
+	ipHeader[1] = 0x00 // TOS
+	// Length (20 + 12 = 32 bytes)
+	ipHeader[2] = 0x00
+	ipHeader[3] = 0x20
+	ipHeader[4] = 0x00 // ID
+	ipHeader[5] = 0x00
+	ipHeader[6] = 0x40                 // Flags (Don't Fragment)
+	ipHeader[7] = 0x00                 // Fragment Offset
+	ipHeader[8] = 0xFF                 // TTL
+	ipHeader[9] = byte(VRRP_PROTO_NUM) // Protocol
+	// Checksum будет вычислен позже
+	ipHeader[10] = 0x00
+	ipHeader[11] = 0x00
+	// Src IP - используем первый IP интерфейса
+	srcIP := v.getInterfaceIP()
+	copy(ipHeader[12:16], srcIP.To4())
+	// Dst IP - VRRP multicast 224.0.0.18
+	copy(ipHeader[16:20], net.ParseIP("224.0.0.18").To4())
 
-	// Создаем Ethernet фрейм
-	ethHdr := &layers.Ethernet{
-		SrcMAC:       v.iface.HardwareAddr,
-		DstMAC:       net.HardwareAddr{0x01, 0x00, 0x5e, 0x00, 0x00, 0x12}, // VRRP multicast MAC
-		EthernetType: layers.EthernetTypeIPv4,
-	}
+	// Вычисляем IP checksum
+	ipChecksum := v.calculateIPChecksum(ipHeader[:20])
+	ipHeader[10] = byte(ipChecksum >> 8)
+	ipHeader[11] = byte(ipChecksum & 0xFF)
 
-	// Собираем пакет
-	buffer := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{
-		FixLengths:       true,
-		ComputeChecksums: true,
-	}
-
-	if err := gopacket.SerializeLayers(buffer, opts,
-		ethHdr,
-		ipHdr,
-		gopacket.Payload(vrrpData),
-	); err != nil {
-		return fmt.Errorf("failed to serialize VRRP packet: %w", err)
-	}
+	// Собираем полный пакет
+	packetData := make([]byte, len(ipHeader)+len(vrrpData))
+	copy(packetData, ipHeader)
+	copy(packetData[20:], vrrpData)
 
 	// Отправляем пакет
-	_, err := v.conn.WriteTo(buffer.Bytes(), &packet.Addr{HardwareAddr: ethHdr.DstMAC})
+	dstAddr := &packet.Addr{
+		HardwareAddr: net.HardwareAddr{0x01, 0x00, 0x5e, 0x00, 0x00, 0x12}, // VRRP multicast MAC
+	}
+
+	_, err := v.conn.WriteTo(packetData, dstAddr)
 	if err != nil {
 		return fmt.Errorf("failed to send VRRP packet: %w", err)
 	}
 
 	return nil
+}
+
+func (v *VRRP) calculateIPChecksum(header []byte) uint16 {
+	// Копируем заголовок и обнуляем поле checksum
+	checksumHeader := make([]byte, len(header))
+	copy(checksumHeader, header)
+	checksumHeader[10] = 0
+	checksumHeader[11] = 0
+
+	var sum uint32
+	for i := 0; i < len(checksumHeader); i += 2 {
+		sum += uint32(checksumHeader[i])<<8 | uint32(checksumHeader[i+1])
+	}
+
+	// Складываем переносы
+	for sum>>16 > 0 {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+
+	// Инвертируем результат
+	return ^uint16(sum)
 }
 
 func (v *VRRP) getInterfaceIP() net.IP {
