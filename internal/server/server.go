@@ -105,10 +105,10 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 
 		// (Опционально) Регистрируем обработчики переходов состояний
-		// s.vr.Enroll(vrrp.Master2Backup, func() { /* обработка перехода в BACKUP */ })
-		// s.vr.Enroll(vrrp.Backup2Master, func() { /* обработка перехода в MASTER */ })
-		// s.vr.Enroll(vrrp.Init2Master, func() { /* обработка перехода в MASTER из INIT */ })
-		// s.vr.Enroll(vrrp.Init2Backup, func() { /* обработка перехода в BACKUP из INIT */ })
+		s.vr.Enroll(VRRP.Master2Backup, func() { log.Info("init to MASTER") })
+		s.vr.Enroll(VRRP.Backup2Master, func() { log.Info("backup to MASTER") })
+		s.vr.Enroll(VRRP.Init2Master, func() { log.Info("init to BACKUP") })
+		s.vr.Enroll(VRRP.Init2Backup, func() { log.Info("master to BACKUP") })
 
 		s.vr.SetPreemptMode(true)
 
